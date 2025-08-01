@@ -1,33 +1,24 @@
 import os
-import json
 import logging
-from flask import Flask, request
-import telegram
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+import json
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
+from aiogram.utils import executor
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Настройки
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GOOGLE_CREDS_JSON = json.loads(os.environ.get("GOOGLE_CREDS_JSON"))
+# Logging
+logging.basicConfig(level=logging.INFO)
 
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
-app = Flask(__name__)
+# Tokens
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-# Авторизация в Google Sheets
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON, scopes=SCOPES)
-sheets_service = build('sheets', 'v4', credentials=creds)
+# Init bot
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-    chat_id = update.message.chat.id
-    text = update.message.text
-
-    # Пример ответа на текстовое сообщение
-    if text.lower().startswith("hello") or text.lower().startswith("/start"):
-        bot.send_message(chat_id=chat_id, text="👋 Привет! Бот работает. Готов к работе.")
-    else:
-        bot.send_message(chat_id=chat_id, text=f"Получено сообщение: {text}")
-
-    return 'ok'
+# Google Sheets auth
+def get_gspread_client():
+    scope = ['https://spreadsheets.google.com/feeds',
+             'https://www.googleapis.com/auth/drive']
