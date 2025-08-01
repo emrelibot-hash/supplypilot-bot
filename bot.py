@@ -41,25 +41,22 @@ def webhook():
     if text.startswith("/start"):
         send_message(chat_id, "👋 Привет, Низами! Бот запущен и готов к работе.")
 
-    # 2) /test — проверка Google Sheets
+    # 2) /test
     elif text.startswith("/test"):
-        # записываем A1 первой вкладки
         meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         first_title = meta["sheets"][0]["properties"]["title"]
         range_name = f"'{first_title}'!A1"
-        body = {"values": [["✅ Bot connected"]]}
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name,
             valueInputOption="RAW",
-            body=body
+            body={"values":[["✅ Bot connected"]]}
         ).execute()
         send_message(chat_id, f"✅ Google Sheets обновлены на листе «{first_title}».")
 
-    # 3) Создать RFQ <название проекта>
+    # 3) Создать RFQ
     elif text.lower().startswith("создать rfq"):
         project_name = text[len("создать rfq"):].strip()
-        # прочитать метаданные, найти все RFQ-* листы
         meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         existing = [
             s["properties"]["title"]
@@ -68,15 +65,11 @@ def webhook():
         ]
         next_num = len(existing) + 1
         new_title = f"RFQ-{next_num}"
-
-        # создаём новый лист
         batch = {"requests":[{"addSheet":{"properties":{"title":new_title}}}]}
         resp = service.spreadsheets().batchUpdate(
             spreadsheetId=SPREADSHEET_ID, body=batch
         ).execute()
         sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-
-        # пишем заголовки
         headers = [["Поставщик","Цена USD","Условия","Комментарий"]]
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -84,12 +77,40 @@ def webhook():
             valueInputOption="RAW",
             body={"values":headers}
         ).execute()
-
-        # формируем ссылку и отвечаем
         link = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
         send_message(chat_id, f"✔ Лист {new_title} для «{project_name}» создан: {link}")
 
-    # 4) всё остальное — эхо
+    # 4) Добавь КП к RFQ-…
+    elif text.lower().startswith("добавь кп к rfq-"):
+        # разбиваем заголовок и данные
+        head, _, body = text.partition(":")
+        rfq_label = head.strip().split()[-1].upper()         # e.g. "RFQ-1"
+        lines = [l.strip() for l in body.strip().splitlines() if l.strip()]
+        rows = []
+        for line in lines:
+            # разделяем по EM dash или обычному тире
+            if "—" in line:
+                sup, rest = line.split("—",1)
+            elif "-" in line:
+                sup, rest = line.split("-",1)
+            else:
+                continue
+            sup = sup.strip()
+            parts = rest.strip().split()  # e.g. ["$10.5/kg","FCA","Ordu"]
+            price = parts[0]
+            terms = " ".join(parts[1:]) if len(parts)>1 else ""
+            rows.append([sup, price, terms, ""])
+        # вставляем после заголовка
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{rfq_label}'!A2",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values":rows}
+        ).execute()
+        send_message(chat_id, f"➡ Добавлено {len(rows)} строк(и) в таблицу {rfq_label}.")
+
+    # 5) всё остальное
     else:
         send_message(chat_id, f"Получено: {text}")
 
