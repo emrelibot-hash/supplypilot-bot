@@ -1,63 +1,33 @@
-import os
-import json
-import requests
-from flask import Flask, request
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+    elif text.lower().startswith("создать rfq"):
+        # Извлекаем название проекта
+        project_name = text[len("создать rfq"):].strip()
+        # Получаем текущее количество листов
+        meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        existing = [s["properties"]["title"] for s in meta["sheets"] if s["properties"]["title"].startswith("RFQ-")]
+        next_num = len(existing) + 1
+        new_title = f"RFQ-{next_num}"
 
-# Telegram
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+        # Создаём новый лист
+        batch = {
+            "requests": [
+                {"addSheet": {"properties": {"title": new_title}}}
+            ]
+        }
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body=batch
+        ).execute()
 
-# Google Sheets
-SPREADSHEET_ID = "1GL0_wzT3OaFBPQk6opiDaSdel4uVzpr_lcTbJtBNlxk"
-# Считываем файл сервисного аккаунта
-CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "vika-bot.json")
-creds = service_account.Credentials.from_service_account_file(
-    CREDS_PATH,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-service = build("sheets", "v4", credentials=creds)
-
-# Получаем метаданные, чтобы узнать реальное имя первой вкладки
-meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-FIRST_SHEET_TITLE = meta["sheets"][0]["properties"]["title"]
-
-app = Flask(__name__)
-
-def send_message(chat_id: int, text: str):
-    requests.post(
-        f"{API_URL}/sendMessage",
-        json={"chat_id": chat_id, "text": text}
-    )
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    msg = data.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "")
-
-    if not chat_id:
-        return "ok", 200
-
-    if text.startswith("/start"):
-        send_message(chat_id, "👋 Привет, Низами! Бот запущен и готов к работе.")
-    elif text.startswith("/test"):
-        # Динамический диапазон
-        range_name = f"'{FIRST_SHEET_TITLE}'!A1"
-        body = {"values": [["✅ Bot connected"]]}
+        # Записываем заголовки в новую вкладку
+        headers = [["Поставщик", "Цена USD", "Условия", "Комментарий"]]
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=range_name,
+            range=f"'{new_title}'!A1",
             valueInputOption="RAW",
-            body=body
+            body={"values": headers}
         ).execute()
-        send_message(chat_id, f"✅ Google Sheets обновлены на листе «{FIRST_SHEET_TITLE}».")
-    else:
-        send_message(chat_id, f"Получено: {text}")
 
-    return "ok", 200
+        # Формируем ссылку на лист
+        sheet_id = [s["properties"]["sheetId"] for s in meta["sheets"] if s["properties"]["title"] == new_title][0]
+        link = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        send_message(chat_id, f"✔ Лист {new_title} для “{project_name}” создан: {link}")
