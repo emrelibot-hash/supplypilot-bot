@@ -2,9 +2,25 @@ import os
 import json
 import requests
 from flask import Flask, request
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
+# ** Настройки из окружения **
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# ** Параметры Google Sheets **
+SPREADSHEET_ID = "1GL0_wzT3OaFBPQk6opiDaSdel4uVzpr_lcTbJtBNlxk"
+SHEET_NAME = "Sheet1"
+GOOGLE_CREDS_JSON = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
+
+# Инициализация Google Sheets клиента
+creds = service_account.Credentials.from_service_account_info(
+    GOOGLE_CREDS_JSON,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+sheets_service = build("sheets", "v4", credentials=creds)
+
 app = Flask(__name__)
 
 def send_message(chat_id: int, text: str):
@@ -25,6 +41,16 @@ def webhook():
 
     if text.startswith("/start"):
         send_message(chat_id, "👋 Привет, Низами! Бот запущен и готов к работе.")
+    elif text.startswith("/test"):
+        # Запись в Google Sheets
+        body = {"values": [["✅ Bot connected"]]}
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SHEET_NAME}!A1",
+            valueInputOption="RAW",
+            body=body
+        ).execute()
+        send_message(chat_id, "✅ Google Sheets обновлены.")
     else:
         send_message(chat_id, f"Получено: {text}")
 
