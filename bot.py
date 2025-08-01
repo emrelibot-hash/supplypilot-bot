@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from flask import Flask, request
 from google.oauth2 import service_account
@@ -10,15 +11,17 @@ API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # Google Sheets
 SPREADSHEET_ID = "1GL0_wzT3OaFBPQk6opiDaSdel4uVzpr_lcTbJtBNlxk"
-SHEET_NAME = "Sheet1"
+# Считываем файл сервисного аккаунта
 CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "vika-bot.json")
-
-# Авторизация по файлу
 creds = service_account.Credentials.from_service_account_file(
     CREDS_PATH,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
-sheets_service = build("sheets", "v4", credentials=creds)
+service = build("sheets", "v4", credentials=creds)
+
+# Получаем метаданные, чтобы узнать реальное имя первой вкладки
+meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+FIRST_SHEET_TITLE = meta["sheets"][0]["properties"]["title"]
 
 app = Flask(__name__)
 
@@ -41,15 +44,16 @@ def webhook():
     if text.startswith("/start"):
         send_message(chat_id, "👋 Привет, Низами! Бот запущен и готов к работе.")
     elif text.startswith("/test"):
-        # Запись в Google Sheets
+        # Динамический диапазон
+        range_name = f"'{FIRST_SHEET_TITLE}'!A1"
         body = {"values": [["✅ Bot connected"]]}
-        sheets_service.spreadsheets().values().update(
+        service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A1",
+            range=range_name,
             valueInputOption="RAW",
             body=body
         ).execute()
-        send_message(chat_id, "✅ Google Sheets обновлены.")
+        send_message(chat_id, f"✅ Google Sheets обновлены на листе «{FIRST_SHEET_TITLE}».")
     else:
         send_message(chat_id, f"Получено: {text}")
 
