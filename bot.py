@@ -3,11 +3,12 @@ import re
 import requests
 import openai
 import pandas as pd
+from zipfile import BadZipFile
 from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# --- Конфиг API-ключей и путей ---
+# --- Конфигурация ключей и ID ---
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "vika-bot.json")
@@ -16,15 +17,13 @@ EXCHANGE_API_URL  = "https://api.exchangerate-api.com/v4/latest/USD"
 
 openai.api_key = OPENAI_API_KEY
 
-# --- Константы для RFQ-парсинга ---
+# --- Постоянные наборы слов для парсинга RFQ/BOQ ---
 INCOTERMS       = {"EXW","FCA","FAS","FOB","CFR","CIF","CPT","CIP","DAT","DAP","DDP"}
 UNITS           = {"kg","g","ton","t","unit","pcs","piece","m","m2","m3"}
 CURRENCIES      = {"USD","EUR","AZN","RUB","GEL"}
 CREATE_TRIGGERS = [
-    "создай ",
-    "сделай ",
-    "создай таблицу ",
-    "сделай сравнительную таблицу ",
+    "создай ", "сделай ",
+    "создай таблицу ", "сделай сравнительную таблицу ",
     "добавь таблицу "
 ]
 
@@ -76,17 +75,17 @@ def webhook():
     if not chat_id:
         return "ok", 200
 
-    # --- Авто-BOQ по прикреплённому .xlsx/.xls без текста ---
+    # --- Авто-BOQ по прикреплённому Excel-файлу, даже без текста ---
     if msg.get("document") and not text:
         fn   = msg["document"].get("file_name", "").lower()
         mime = msg["document"].get("mime_type", "")
-        # проверяем и расширение, и mime_type
-        if fn.endswith((".xlsx", ".xls")) and \
-           mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "application/vnd.ms-excel"):
+        if fn.endswith((".xlsx", ".xls")) and mime in (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel"
+        ):
             project = os.path.splitext(fn)[0]
 
-            # создаём новую вкладку BOQ
+            # Создаём новую вкладку BOQ-#
             meta     = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
             existing = [s["properties"]["title"] for s in meta["sheets"]
                         if s["properties"]["title"].startswith("BOQ-")]
@@ -99,7 +98,7 @@ def webhook():
             sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
             link     = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
-            # скачиваем файл
+            # Скачиваем файл
             file_id = msg["document"]["file_id"]
             r       = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
@@ -109,11 +108,22 @@ def webhook():
             with open("/tmp/tmp.xlsx", "wb") as f:
                 f.write(dl.content)
 
-            # читаем через openpyxl
-            df    = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str, engine="openpyxl")
+            # Читаем через pandas + openpyxl с защитой от BadZipFile
+            try:
+                df    = pd.read_excel("/tmp/tmp.xlsx",
+                                      header=None,
+                                      dtype=str,
+                                      engine="openpyxl")
+            except BadZipFile:
+                send_message(chat_id, "⚠ Файл не является корректным Excel-архивом. Авто-BOQ отменён.")
+                return "ok", 200
+            except Exception as e:
+                send_message(chat_id, f"⚠ Ошибка чтения Excel: {e}")
+                return "ok", 200
+
             table = df.fillna("").values.tolist()
 
-            # переводим каждую ячейку через GPT
+            # Переводим через GPT всю таблицу
             translated = []
             for row in table:
                 tr_row = []
@@ -122,7 +132,7 @@ def webhook():
                     tr_row.append(translate_via_gpt(txt) if txt else "")
                 translated.append(tr_row)
 
-            # записываем в Google Sheet
+            # Пишем в Google Sheets
             sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"'{title}'!A1",
@@ -136,13 +146,13 @@ def webhook():
             )
             return "ok", 200
 
-        else:
-            send_message(chat_id, "⚠ Это не Excel-файл, авто-BOQ не выполнен.")
-            return "ok", 200
+        # не Excel
+        send_message(chat_id, "⚠ Прикреплён не Excel-файл, авто-BOQ не выполнен.")
+        return "ok", 200
 
     # /start
     if lower.startswith("/start"):
-        send_message(chat_id, "👋 Привет! Бот запущен и готов.")
+        send_message(chat_id, "👋 Привет! Бот запущен.")
         return "ok", 200
 
     # /test
@@ -158,15 +168,16 @@ def webhook():
         send_message(chat_id, f"✅ Лист «{title}» обновлён.")
         return "ok", 200
 
-    # Основной триггер: «создай…»
+    # Основной триггер «создай…» / «сделай…»
     for trig in CREATE_TRIGGERS:
         if lower.startswith(trig):
-            # … остальной RFQ/BOQ код без изменений …
+            # здесь ваш существующий код RFQ/BOQ
+            # …
             break
 
-    # Фолбэк
+    # fallback
     send_message(chat_id, f"Получено: {text}")
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
