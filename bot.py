@@ -24,7 +24,6 @@ CREATE_TRIGGERS = [
     "добавь таблицу "
 ]
 
-# кеш для курсов валют
 exchange_rates = {}
 
 def get_usd_rate(cur: str) -> float:
@@ -37,7 +36,7 @@ def get_usd_rate(cur: str) -> float:
         exchange_rates.update(resp.get("rates", {}))
     return exchange_rates.get(cur, 1.0)
 
-# --- Инициализация Sheets API ---
+# Инициализация Google Sheets API
 creds   = service_account.Credentials.from_service_account_file(
     CREDS_PATH,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -78,12 +77,12 @@ def webhook():
         send_message(chat_id, f"✅ Лист «{title}» обновлён.")
         return "ok", 200
 
-    # 3) Создать новый RFQ-лист (и сразу заполнить, если после команды есть КП)
+    # 3) Создать новый RFQ-лист и сразу заполнить (если есть КП в том же сообщении)
     for trig in CREATE_TRIGGERS:
         if lower.startswith(trig):
             lines = text.splitlines()
             project_name = lines[0][len(trig):].strip() or "Без имени"
-            # 3.1) Создаём лист
+            # Создаём лист
             meta     = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
             existing = [s["properties"]["title"] for s in meta["sheets"]
                         if s["properties"]["title"].startswith("RFQ-")]
@@ -104,7 +103,7 @@ def webhook():
             ).execute()
             link = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
-            # 3.2) Если есть дополнительные строки — это КП, парсим сразу
+            # Если после строки создания идут КП−линии
             kp_lines = lines[1:]
             rows = []
             usd_values = []
@@ -125,21 +124,27 @@ def webhook():
                     if supplier.lower() in seen:
                         continue
                     seen.add(supplier.lower())
+
                     price_num = m.group("price").replace(",",".")
                     cur       = (m.group("currency") or "USD").upper()
                     unit      = (m.group("unit") or "").lower()
                     rate      = get_usd_rate(cur)
                     usd_val   = float(price_num) / rate
                     usd_values.append(usd_val)
+
                     tail  = l[e:].strip("—-: ")
                     parts = tail.split()
                     inc   = next((p.upper() for p in parts if p.upper() in INCOTERMS), "")
-                    if inc:
+                    # безопасное удаление
+                    if inc in parts:
                         parts.remove(inc)
                     cond  = " ".join(parts)
+
                     price_cell = f"{price_num} {cur}"
                     rows.append([supplier, price_cell, unit, inc, cond, ""])
+
                 if rows:
+                    # вставка КП
                     service.spreadsheets().values().append(
                         spreadsheetId=SPREADSHEET_ID,
                         range=f"'{new_title}'!A2",
@@ -147,9 +152,10 @@ def webhook():
                         insertDataOption="INSERT_ROWS",
                         body={"values": rows}
                     ).execute()
+                    # подсветка лучшего
                     best_idx = usd_values.index(min(usd_values))
                     reqs = [
-                        {"repeatCell":{
+                        {"repeatCell": {
                             "range": {
                                 "sheetId": sheet_id,
                                 "startRowIndex": 1,
@@ -157,27 +163,28 @@ def webhook():
                                 "startColumnIndex": 0,
                                 "endColumnIndex": 6
                             },
-                            "cell": {"userEnteredFormat":{"backgroundColor":None}},
-                            "fields":"userEnteredFormat.backgroundColor"
+                            "cell": {"userEnteredFormat": {"backgroundColor": None}},
+                            "fields": "userEnteredFormat.backgroundColor"
                         }},
-                        {"repeatCell":{
+                        {"repeatCell": {
                             "range": {
                                 "sheetId": sheet_id,
                                 "startRowIndex": 1 + best_idx,
-                                "endRowIndex":   2 + best_idx,
+                                "endRowIndex": 2 + best_idx,
                                 "startColumnIndex": 0,
                                 "endColumnIndex": 6
                             },
-                            "cell": {"userEnteredFormat":{"backgroundColor":{
-                                "red":0.8,"green":1.0,"blue":0.8
+                            "cell": {"userEnteredFormat": {"backgroundColor": {
+                                "red": 0.8, "green": 1.0, "blue": 0.8
                             }}},
-                            "fields":"userEnteredFormat.backgroundColor"
+                            "fields": "userEnteredFormat.backgroundColor"
                         }}
                     ]
                     service.spreadsheets().batchUpdate(
                         spreadsheetId=SPREADSHEET_ID,
                         body={"requests": reqs}
                     ).execute()
+
                     send_message(chat_id,
                         f"✔ Лист {new_title} для «{project_name}» создан: {link}\n"
                         f"➡ Добавлено {len(rows)} строк, лучший вариант (строка {best_idx+2}) подсвечен.")
@@ -190,7 +197,7 @@ def webhook():
     # 4) Явная команда «Добавить к RFQ...»
     m2 = re.search(r'добав(?:ь|ить).*?rfq[\s\-]?(\d+)', lower)
     if m2:
-        # здесь ваш ранее настроенный код для отдельной команды Add
+        # сюда ваш код обработки добавления без ошибок удаления Incoterm’а
         return "ok", 200
 
     # 5) Эхо
