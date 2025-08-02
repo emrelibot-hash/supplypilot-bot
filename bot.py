@@ -20,7 +20,8 @@ CREATE_TRIGGERS = [
     "создай ",
     "сделай ",
     "создай таблицу ",
-    "сделай сравнительную таблицу "
+    "сделай сравнительную таблицу ",
+    "добавь таблицу "
 ]
 
 # кеш для курсов валют
@@ -108,7 +109,6 @@ def webhook():
             rows = []
             usd_values = []
             if kp_lines:
-                # шаблон для цены+валюты+единицы
                 pat = re.compile(
                     rf'(?P<price>[\d\.,]+)\s*(?P<currency>{"|".join(CURRENCIES)})?'
                     rf'(?:\/\s*(?P<unit>{"|".join(UNITS)}))?',
@@ -118,7 +118,7 @@ def webhook():
                 for ln in kp_lines:
                     l = ln.strip()
                     m = pat.search(l)
-                    if not m: 
+                    if not m:
                         continue
                     s, e = m.span()
                     supplier = l[:s].strip("—-: ").title()
@@ -128,19 +128,17 @@ def webhook():
                     price_num = m.group("price").replace(",",".")
                     cur       = (m.group("currency") or "USD").upper()
                     unit      = (m.group("unit") or "").lower()
-                    # конвертация в USD
                     rate      = get_usd_rate(cur)
                     usd_val   = float(price_num) / rate
                     usd_values.append(usd_val)
-                    # Incoterm + условия
                     tail  = l[e:].strip("—-: ")
                     parts = tail.split()
                     inc   = next((p.upper() for p in parts if p.upper() in INCOTERMS), "")
-                    if inc: parts.remove(inc)
+                    if inc:
+                        parts.remove(inc)
                     cond  = " ".join(parts)
                     price_cell = f"{price_num} {cur}"
                     rows.append([supplier, price_cell, unit, inc, cond, ""])
-                # вставляем, если есть
                 if rows:
                     service.spreadsheets().values().append(
                         spreadsheetId=SPREADSHEET_ID,
@@ -149,9 +147,7 @@ def webhook():
                         insertDataOption="INSERT_ROWS",
                         body={"values": rows}
                     ).execute()
-                    # подсветка лучшего
                     best_idx = usd_values.index(min(usd_values))
-                    # сброс и подсветка
                     reqs = [
                         {"repeatCell":{
                             "range": {
@@ -187,15 +183,14 @@ def webhook():
                         f"➡ Добавлено {len(rows)} строк, лучший вариант (строка {best_idx+2}) подсвечен.")
                     return "ok", 200
 
-            # если КП не было в этом же сообщении
+            # если КП не было
             send_message(chat_id, f"✔ Лист {new_title} для «{project_name}» создан: {link}")
             return "ok", 200
 
-    # 4) Явная команда «Добавить к RFQ...» (парсер + конвертация + подсветка)
+    # 4) Явная команда «Добавить к RFQ...»
     m2 = re.search(r'добав(?:ь|ить).*?rfq[\s\-]?(\d+)', lower)
     if m2:
-        # (существующий код обработки add KPI отдельно)
-        # ...
+        # здесь ваш ранее настроенный код для отдельной команды Add
         return "ok", 200
 
     # 5) Эхо
