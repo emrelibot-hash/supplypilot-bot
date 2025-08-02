@@ -22,8 +22,10 @@ INCOTERMS       = {"EXW","FCA","FAS","FOB","CFR","CIF","CPT","CIP","DAT","DAP","
 UNITS           = {"kg","g","ton","t","unit","pcs","piece","m","m2","m3"}
 CURRENCIES      = {"USD","EUR","AZN","RUB","GEL"}
 CREATE_TRIGGERS = [
-    "создай ", "сделай ",
-    "создай таблицу ", "сделай сравнительную таблицу ",
+    "создай ",
+    "сделай ",
+    "создай таблицу ",
+    "сделай сравнительную таблицу ",
     "добавь таблицу "
 ]
 
@@ -75,7 +77,7 @@ def webhook():
     if not chat_id:
         return "ok", 200
 
-    # --- Авто-BOQ по прикреплённому Excel-файлу, даже без текста ---
+    # --- 1) Авто-BOQ по прикреплённому Excel-файлу (xls/xlsx) без текста ---
     if msg.get("document") and not text:
         fn   = msg["document"].get("file_name", "").lower()
         mime = msg["document"].get("mime_type", "")
@@ -98,7 +100,7 @@ def webhook():
             sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
             link     = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
-            # Скачиваем файл
+            # Скачиваем файл из Telegram
             file_id = msg["document"]["file_id"]
             r       = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
@@ -108,14 +110,23 @@ def webhook():
             with open("/tmp/tmp.xlsx", "wb") as f:
                 f.write(dl.content)
 
-            # Читаем через pandas + openpyxl с защитой от BadZipFile
+            # Выбираем движок по расширению и читаем через pandas
+            engine = "xlrd" if fn.endswith(".xls") else "openpyxl"
             try:
-                df    = pd.read_excel("/tmp/tmp.xlsx",
-                                      header=None,
-                                      dtype=str,
-                                      engine="openpyxl")
+                df = pd.read_excel(
+                    "/tmp/tmp.xlsx",
+                    header=None,
+                    dtype=str,
+                    engine=engine
+                )
             except BadZipFile:
                 send_message(chat_id, "⚠ Файл не является корректным Excel-архивом. Авто-BOQ отменён.")
+                return "ok", 200
+            except ImportError:
+                send_message(
+                    chat_id,
+                    f"⚠ Движок чтения `{engine}` не установлен. Добавьте в requirements.txt `{engine}`"
+                )
                 return "ok", 200
             except Exception as e:
                 send_message(chat_id, f"⚠ Ошибка чтения Excel: {e}")
@@ -123,7 +134,7 @@ def webhook():
 
             table = df.fillna("").values.tolist()
 
-            # Переводим через GPT всю таблицу
+            # Переводим каждую ячейку через GPT
             translated = []
             for row in table:
                 tr_row = []
@@ -132,7 +143,7 @@ def webhook():
                     tr_row.append(translate_via_gpt(txt) if txt else "")
                 translated.append(tr_row)
 
-            # Пишем в Google Sheets
+            # Записываем результат в Google Sheets
             sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"'{title}'!A1",
@@ -146,16 +157,15 @@ def webhook():
             )
             return "ok", 200
 
-        # не Excel
+        # файл не Excel
         send_message(chat_id, "⚠ Прикреплён не Excel-файл, авто-BOQ не выполнен.")
         return "ok", 200
 
-    # /start
+    # --- 2) Стандартные команды ---
     if lower.startswith("/start"):
-        send_message(chat_id, "👋 Привет! Бот запущен.")
+        send_message(chat_id, "👋 Привет! Бот запущен и готов к работе.")
         return "ok", 200
 
-    # /test
     if lower.startswith("/test"):
         meta  = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         title = meta["sheets"][0]["properties"]["title"]
@@ -168,14 +178,14 @@ def webhook():
         send_message(chat_id, f"✅ Лист «{title}» обновлён.")
         return "ok", 200
 
-    # Основной триггер «создай…» / «сделай…»
+    # --- 3) Обработка текстовых триггеров «создай…» и т.д. ---
     for trig in CREATE_TRIGGERS:
         if lower.startswith(trig):
-            # здесь ваш существующий код RFQ/BOQ
-            # …
-            break
+            # Здесь можно вставить вашу логику обработки RFQ/BOQ из текстового сообщения
+            send_message(chat_id, "⚙ Команда создания таблицы распознана (готово к доработке).")
+            return "ok", 200
 
-    # fallback
+    # --- 4) Фолбэк ---
     send_message(chat_id, f"Получено: {text}")
     return "ok", 200
 
