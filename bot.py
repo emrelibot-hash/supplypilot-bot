@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import openai
+import pandas as pd
 from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -119,16 +120,33 @@ def webhook():
             link      = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
             if is_boq:
-                # --- BOQ: парсим CSV/таб, переводим через GPT, вставляем ---
-                table = [re.split(r'[;\t]+', row) for row in data_lines]
+                # --- BOQ: парсим Excel или CSV/таб
+                if msg.get("document"):
+                    file_id = msg["document"]["file_id"]
+                    # получаем путь к файлу
+                    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}").json()
+                    path = r["result"]["file_path"]
+                    # скачиваем сам файл
+                    dl = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}")
+                    with open("/tmp/tmp.xlsx", "wb") as f:
+                        f.write(dl.content)
+                    # читаем все ячейки первого листа Excel
+                    df = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str)
+                    table = df.fillna("").values.tolist()
+                else:
+                    # fallback: старый разбор текста через ';' или табуляцию
+                    table = [re.split(r'[;\t]+', row) for row in data_lines]
+
+                # переводим каждую ячейку через GPT
                 translated = []
                 for row in table:
                     tr_row = []
                     for cell in row:
-                        txt = cell.strip()
+                        txt = (cell or "").strip()
                         tr_row.append(translate_via_gpt(txt) if txt else "")
                     translated.append(tr_row)
 
+                # записываем в Google Sheet
                 sheets.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
                     range=f"'{title}'!A1",
@@ -206,9 +224,8 @@ def webhook():
                             "startColumnIndex": 0,
                             "endColumnIndex": 6
                         },
-                        "cell": {"userEnteredFormat": {"backgroundColor": {
-                            "red":0.8,"green":1.0,"blue":0.8
-                        }}},
+                        "cell": {"userEnteredFormat": {"backgroundColor":
+                            {"red":0.8,"green":1.0,"blue":0.8}}},
                         "fields":"userEnteredFormat.backgroundColor"
                     }}
                 ]
