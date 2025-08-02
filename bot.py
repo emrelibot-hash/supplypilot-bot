@@ -28,7 +28,6 @@ CREATE_TRIGGERS = [
     "добавь таблицу "
 ]
 
-# Кэш курсов валют
 exchange_rates = {}
 
 def get_usd_rate(cur: str) -> float:
@@ -41,7 +40,6 @@ def get_usd_rate(cur: str) -> float:
     return exchange_rates.get(cur, 1.0)
 
 def translate_via_gpt(text: str) -> str:
-    """Запрос перевода любого текста на английский через ChatGPT."""
     resp = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
@@ -52,12 +50,11 @@ def translate_via_gpt(text: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# --- Инициализация Google Sheets API ---
-creds   = service_account.Credentials.from_service_account_file(
+creds  = service_account.Credentials.from_service_account_file(
     GOOGLE_CREDS_PATH,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
-sheets  = build("sheets", "v4", credentials=creds)
+sheets = build("sheets", "v4", credentials=creds)
 
 app = Flask(__name__)
 
@@ -80,35 +77,38 @@ def webhook():
 
     # === Авто-BOQ по прикреплённому .xlsx без текста ===
     if msg.get("document") and not text:
-        # Название проекта из имени файла
         filename = msg["document"].get("file_name", "Без имени.xlsx")
         project  = os.path.splitext(filename)[0]
 
-        # Создаём новую вкладку BOQ
-        meta      = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        existing  = [s["properties"]["title"] for s in meta["sheets"] if s["properties"]["title"].startswith("BOQ-")]
-        idx       = len(existing) + 1
-        title     = f"BOQ-{idx}"
-        resp      = sheets.spreadsheets().batchUpdate(
+        meta     = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        existing = [
+            s["properties"]["title"]
+            for s in meta["sheets"]
+            if s["properties"]["title"].startswith("BOQ-")
+        ]
+        idx    = len(existing) + 1
+        title  = f"BOQ-{idx}"
+        resp   = sheets.spreadsheets().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
             body={"requests":[{"addSheet":{"properties":{"title":title}}}]}
         ).execute()
-        sheet_id  = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-        link      = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
+        sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+        link     = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
-        # Скачиваем файл
+        # скачиваем файл
         file_id = msg["document"]["file_id"]
-        r       = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}").json()
+        r       = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}"
+        ).json()
         path    = r["result"]["file_path"]
         dl      = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}")
         with open("/tmp/tmp.xlsx", "wb") as f:
             f.write(dl.content)
 
-        # Читаем все ячейки первого листа Excel
-        df    = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str)
+        # читаем через openpyxl
+        df    = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str, engine="openpyxl")
         table = df.fillna("").values.tolist()
 
-        # Переводим каждую ячейку через GPT
         translated = []
         for row in table:
             tr_row = []
@@ -117,7 +117,6 @@ def webhook():
                 tr_row.append(translate_via_gpt(txt) if txt else "")
             translated.append(tr_row)
 
-        # Записываем в Google Sheet
         sheets.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{title}'!A1",
@@ -125,8 +124,10 @@ def webhook():
             body={"values": translated}
         ).execute()
 
-        send_message(chat_id,
-            f"✔ Авто-BOQ: лист {title} для проекта «{project}» создан и переведён:\n{link}")
+        send_message(
+            chat_id,
+            f"✔ Авто-BOQ: лист {title} для проекта «{project}» создан и переведён:\n{link}"
+        )
         return "ok", 200
 
     # /start
@@ -147,7 +148,7 @@ def webhook():
         send_message(chat_id, f"✅ Лист «{title}» обновлён.")
         return "ok", 200
 
-    # Основной триггер: «создай…» + BOQ или RFQ
+    # Основной триггер
     for trig in CREATE_TRIGGERS:
         if lower.startswith(trig):
             lines      = text.splitlines()
@@ -156,21 +157,22 @@ def webhook():
             is_boq     = any(';' in l or '\t' in l for l in data_lines)
             prefix     = "BOQ-" if is_boq else "RFQ-"
 
-            # Создание новой вкладки
             meta     = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-            existing = [s["properties"]["title"] for s in meta["sheets"]
-                        if s["properties"]["title"].startswith(prefix)]
-            idx       = len(existing) + 1
-            title     = f"{prefix}{idx}"
-            resp      = sheets.spreadsheets().batchUpdate(
+            existing = [
+                s["properties"]["title"]
+                for s in meta["sheets"]
+                if s["properties"]["title"].startswith(prefix)
+            ]
+            idx    = len(existing) + 1
+            title  = f"{prefix}{idx}"
+            resp   = sheets.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={"requests":[{"addSheet":{"properties":{"title":title}}}]}
             ).execute()
-            sheet_id  = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-            link      = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
+            sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+            link     = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
             if is_boq:
-                # BOQ: текстовый или Excel в data_lines
                 table = [re.split(r'[;\t]+', row) for row in data_lines]
                 translated = []
                 for row in table:
@@ -185,11 +187,13 @@ def webhook():
                     valueInputOption="RAW",
                     body={"values": translated}
                 ).execute()
-                send_message(chat_id,
-                    f"✔ Лист {title} для BOQ «{project}» создан и переведён:\n{link}")
+                send_message(
+                    chat_id,
+                    f"✔ Лист {title} для BOQ «{project}» создан и переведён:\n{link}"
+                )
                 return "ok", 200
 
-            # RFQ: шапка + парсинг КП
+            # RFQ
             sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"'{title}'!A1",
@@ -265,9 +269,11 @@ def webhook():
                     body={"requests": reqs}
                 ).execute()
 
-                send_message(chat_id,
+                send_message(
+                    chat_id,
                     f"✔ Лист {title} для «{project}» создан:\n{link}\n"
-                    f"➡ Добавлено {len(rows)} строк, лучший вариант (строка {best+2}) подсвечен.")
+                    f"➡ Добавлено {len(rows)} строк, лучший вариант (строка {best+2}) подсвечен."
+                )
                 return "ok", 200
 
             send_message(chat_id, f"✔ Лист {title} для «{project}» создан:\n{link}")
