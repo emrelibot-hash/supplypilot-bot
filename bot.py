@@ -78,6 +78,57 @@ def webhook():
     if not chat_id:
         return "ok", 200
 
+    # === Авто-BOQ по прикреплённому .xlsx без текста ===
+    if msg.get("document") and not text:
+        # Название проекта из имени файла
+        filename = msg["document"].get("file_name", "Без имени.xlsx")
+        project  = os.path.splitext(filename)[0]
+
+        # Создаём новую вкладку BOQ
+        meta      = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        existing  = [s["properties"]["title"] for s in meta["sheets"] if s["properties"]["title"].startswith("BOQ-")]
+        idx       = len(existing) + 1
+        title     = f"BOQ-{idx}"
+        resp      = sheets.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests":[{"addSheet":{"properties":{"title":title}}}]}
+        ).execute()
+        sheet_id  = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+        link      = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
+
+        # Скачиваем файл
+        file_id = msg["document"]["file_id"]
+        r       = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}").json()
+        path    = r["result"]["file_path"]
+        dl      = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}")
+        with open("/tmp/tmp.xlsx", "wb") as f:
+            f.write(dl.content)
+
+        # Читаем все ячейки первого листа Excel
+        df    = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str)
+        table = df.fillna("").values.tolist()
+
+        # Переводим каждую ячейку через GPT
+        translated = []
+        for row in table:
+            tr_row = []
+            for cell in row:
+                txt = (cell or "").strip()
+                tr_row.append(translate_via_gpt(txt) if txt else "")
+            translated.append(tr_row)
+
+        # Записываем в Google Sheet
+        sheets.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{title}'!A1",
+            valueInputOption="RAW",
+            body={"values": translated}
+        ).execute()
+
+        send_message(chat_id,
+            f"✔ Авто-BOQ: лист {title} для проекта «{project}» создан и переведён:\n{link}")
+        return "ok", 200
+
     # /start
     if lower.startswith("/start"):
         send_message(chat_id, "👋 Привет! Бот запущен и готов.")
@@ -96,17 +147,16 @@ def webhook():
         send_message(chat_id, f"✅ Лист «{title}» обновлён.")
         return "ok", 200
 
-    # Основной триггер: «создай…» + BOQ или RFQ в одном сообщении
+    # Основной триггер: «создай…» + BOQ или RFQ
     for trig in CREATE_TRIGGERS:
         if lower.startswith(trig):
             lines      = text.splitlines()
             project    = lines[0][len(trig):].strip() or "Без имени"
             data_lines = [l for l in lines[1:] if l.strip()]
-            # если в строках есть ';' или табуляция — считаем это BOQ
             is_boq     = any(';' in l or '\t' in l for l in data_lines)
             prefix     = "BOQ-" if is_boq else "RFQ-"
 
-            # создаём новую вкладку
+            # Создание новой вкладки
             meta     = sheets.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
             existing = [s["properties"]["title"] for s in meta["sheets"]
                         if s["properties"]["title"].startswith(prefix)]
@@ -120,24 +170,8 @@ def webhook():
             link      = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={sheet_id}"
 
             if is_boq:
-                # --- BOQ: парсим Excel или CSV/таб
-                if msg.get("document"):
-                    file_id = msg["document"]["file_id"]
-                    # получаем путь к файлу
-                    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}").json()
-                    path = r["result"]["file_path"]
-                    # скачиваем сам файл
-                    dl = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}")
-                    with open("/tmp/tmp.xlsx", "wb") as f:
-                        f.write(dl.content)
-                    # читаем все ячейки первого листа Excel
-                    df = pd.read_excel("/tmp/tmp.xlsx", header=None, dtype=str)
-                    table = df.fillna("").values.tolist()
-                else:
-                    # fallback: старый разбор текста через ';' или табуляцию
-                    table = [re.split(r'[;\t]+', row) for row in data_lines]
-
-                # переводим каждую ячейку через GPT
+                # BOQ: текстовый или Excel в data_lines
+                table = [re.split(r'[;\t]+', row) for row in data_lines]
                 translated = []
                 for row in table:
                     tr_row = []
@@ -145,20 +179,17 @@ def webhook():
                         txt = (cell or "").strip()
                         tr_row.append(translate_via_gpt(txt) if txt else "")
                     translated.append(tr_row)
-
-                # записываем в Google Sheet
                 sheets.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
                     range=f"'{title}'!A1",
                     valueInputOption="RAW",
                     body={"values": translated}
                 ).execute()
-
                 send_message(chat_id,
                     f"✔ Лист {title} для BOQ «{project}» создан и переведён:\n{link}")
                 return "ok", 200
 
-            # --- RFQ: создаём шапку и парсим КП-строки ---
+            # RFQ: шапка + парсинг КП
             sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"'{title}'!A1",
