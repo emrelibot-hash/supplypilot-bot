@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "vika-bot-467716",
+  "private_key_id": "d3e384227d468cb366a3ac7a733c3f8c68e09eb1",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQClLhLdaaKruP2+\n4tJ8PsvEcv4xlBBMrJB8hnNIqXI9YsIMJyvEo1NGDiUt0WplvOGZHVfZLX0AyiVx\n41nNZneG8Sz8L+WFgAdqI+usUSqJaz19DnSOXFePJN9KffpWo4bK4vKehkcvFF3z\n9T+R1fvqKo1cYDF+0X80LWqF1wSI8kTJrC04CSTU804jzFdN96rR813gyH2EjOPD\nzuLY86icM46VfukxsPFvynjxlHGW7innfKYc5CYd5ZWkt9cAlmND0Hcr9JsvFdbg\nFicOCTktksXB7TqZ6gtlE31DodiiATBgs/6kT4nVej/IGVQ5JbO1d4KvOY5LjB4R\n8dvIbp9/AgMBAAECggEAEVEDtEeLQLJrk5Pm2hShOw6NHHh3vvoGSa+0rUTqT4on\naqu+mGZA6CK6fhOqslC7W9hqKb/tj2Qhyc86TmC0HibxftyslLLH1DZA0jdOHMrr\nzszxpi0DFuQYLpCHaobJLkLdiYXtN3/Mm7M1v12uA64DVNBW0AM5cShjtvVEKfEE\nowW4oFpML4ZsVYiMIzT17AKgj9Dj1vkB4Fp6jgOAyK6E7I/HeeHQ1VnynoxbRn7Y\nXFEF7iXVyGNtJ7L0htF1f9tfmiIOcHJlRwgqFRvRnaCozMYLUWs6O6Acu/1Bxtaz\n/I4IE6bD9ATFigwYzmG30A6PrZkOB0F+20SvImb09QKBgQDmwsPtTnaB6VKJV4G4\nxmDSLik4sBQKL3kKgzM9lkphFo6eE3lkmhl5yAccB7aci8Aem+DEyw1tZyBpWDFs\nMTXN92hr3sE2CubTeI3kL1QEvOBJY3BrfjtcKZGZzAs9kv0+LJ85lY2/B+DNgswv\nEvZn5DTJh3PmIjDED7QU9qbdUwKBgQC3PxCBHa9On+Q3SIXzXOdEzxDwIhAuQYo7\nTynpGAhlHmuz+YvlvlnBbOY4sjy0Y9/lImJb5rRGzKv26xDCC8JE4MPM3vV70HvH\n3UwLJ6sGOGLOcDq+BoQ9JT/1+2FBzAV2MKcILRMSmBDiMKwlmNqTm9CVtuaNrRwn\nNmekiU4DpQKBgQCRA/qeif19XIRK3RwfY0N7Mhkjj7u4PuchDRxJasYpR0Su4Gwc\nJZ824dZd7hb7P/OnCKxy32v7waAjs5GzfSVj30PW7jCbZrRyVsNMj9WL+Ko2VHBU\njQp+u3zNmuXBdzsANIiHZo2ibDAA1l68gn0pAseNkjrqd7gPrhKsTejFEwKBgQCl\nf+myE1NfmX0OiQuhzoh5VuKfXsRqYnssMcVSZog+e4kelQVKy+5YibgsAJ5e9c0j\nLzjSc7ziLLwrWAZcmy4r8ywj/kKMPrFsw2uIr50BEy/57ta/BTet2dS4nv8p49AS\n/MH+2mbdZkXpY7g2hKT0p8dtUDFOR8ijibl1myTAmQKBgQCuinjZLc7GswD8ZgWA\nphwb4V4jHk8/oHt47doBMwGZpFGraAguipBK+hOTL9ih3fXHgsf9aTfSJ4IIRPKB\nA0xVVEVFySKO+JZEd4otC5pFll+5AnvHhIRLJacTlukpVYcI6tN694E5yq1t2nu0\n/yplZ9Efdr7sPWxnXRQLEzj+Gg==\n-----END PRIVATE KEY-----\n",
+  "client_email": "vika-bot@vika-bot-467716.iam.gserviceaccount.com",
+  "client_id": "114717214539848889343",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/vika-bot%40vika-bot-467716.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
