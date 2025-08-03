@@ -1,9 +1,11 @@
-flask
-openai
+# requirements.txt
 pandas
 gspread
-oauth2client
 gspread-dataframe
+openai
+python-telegram-bot==13.15
+pyMuPDF
+Flask
+oauth2client
 google-api-python-client
-pyTelegramBotAPI
-PyMuPDF
+python-dotenv
