@@ -9,3 +9,4 @@ oauth2client
 google-api-python-client
 python-dotenv
 xlrd==2.0.1
+openpyxl
