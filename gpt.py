@@ -6,99 +6,78 @@ import os
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+def detect_language(text):
+    if re.search(r'[а-яА-ЯёЁ]', text):
+        return "russian"
+    if re.search(r'[a-zA-Z]', text):
+        return "english"
+    return "other"
+
+def translate_text(text):
+    lang = detect_language(text)
+    if lang in ["russian", "english"]:
+        return text  # не переводим
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a helpful translator. Translate the following text to English."},
+            {"role": "user", "content": text}
+        ],
+        temperature=0.2
+    )
+    return response.choices[0].message.content.strip()
 
 def translate_and_structure_boq(text):
-    if not openai.api_key:
-        # GPT API not set — fallback: return plain DataFrame
-        lines = [line for line in text.splitlines() if line.strip()]
-        df = pd.DataFrame({"Description": lines, "Qty": "", "Unit": ""})
-        return df
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    structured_rows = []
 
-    prompt = f"""
-    Преобразуй следующий список позиций в таблицу со столбцами:
-    Description | Qty | Unit
+    for line in lines:
+        translated = translate_text(line)
+        structured_rows.append([translated])
 
-    Если строка уже на английском или русском — не переводи. Если на другом языке — переведи на английский.
-
-    Входной текст:
-    {text}
-    """
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    raw = response["choices"][0]["message"]["content"]
-    rows = [re.split(r"\s{2,}|\t", line.strip()) for line in raw.splitlines() if line.strip()]
-    df = pd.DataFrame(rows[1:], columns=rows[0]) if len(rows) > 1 else pd.DataFrame()
+    df = pd.DataFrame(structured_rows, columns=["BOQ Item"])
     return df
 
-
 def extract_supplier_offer(text):
-    if not openai.api_key:
-        raise RuntimeError("GPT API ключ не задан для обработки PDF")
-
-    prompt = f"""
-    В извлеченном тексте КП найди:
-    - Название поставщика (Company Name)
-    - Таблицу предложений: Description | Qty | Unit | Unit Price
-
-    Верни результат в виде JSON Python-словаря:
-    {
-      "supplier": "...",
-      "offers": [
-        {"description": "...", "qty": ..., "unit": "pcs", "unit_price": ...},
-        ...
-      ]
-    }
-
-    КП:
-    {text}
-    """
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    parsed = eval(response["choices"][0]["message"]["content"])
-    return parsed["supplier"], parsed["offers"]
-
-
-def update_sheet_with_offer(boq_df, offer_data, supplier):
-    unit_col = f"{supplier} Unit Price"
-    total_col = f"{supplier} Total"
-    notes_col = f"{supplier} Notes"
-
-    boq_df[unit_col] = ""
-    boq_df[total_col] = ""
-    boq_df[notes_col] = ""
-
-    for i, row in boq_df.iterrows():
-        matched = None
-        for offer in offer_data:
-            if offer["description"][:15].lower() in row["Description"].lower():
-                matched = offer
-                break
-
-        if matched:
-            try:
-                boq_qty = float(row["Qty"])
-                unit_price = float(matched["unit_price"])
-                offer_qty = float(matched["qty"])
-
-                boq_df.at[i, unit_col] = unit_price
-                boq_df.at[i, total_col] = unit_price * boq_qty
-
-                if offer_qty != boq_qty:
-                    boq_df.at[i, notes_col] = f"offered qty {offer_qty}, required {boq_qty}"
-                else:
-                    boq_df.at[i, notes_col] = "match"
-            except:
-                boq_df.at[i, notes_col] = "parse error"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    offers = []
+    for line in lines:
+        match = re.search(r'(\d+(?:\.\d+)?)\s*(USD|EUR|GEL)', line, re.IGNORECASE)
+        if match:
+            offers.append({"raw": line, "price": match.group(1), "currency": match.group(2).upper()})
         else:
-            boq_df.at[i, notes_col] = "not offered"
+            offers.append({"raw": line, "price": None, "currency": None})
+    return offers
 
-    return boq_df
+def compare_offer_with_boq(text, boq_df):
+    offers = extract_supplier_offer(text)
+    result = []
+    for offer in offers:
+        result.append({
+            "BOQ Match": find_best_match(offer["raw"], boq_df),
+            "Offered Description": offer["raw"],
+            "Unit Price": offer["price"],
+            "Currency": offer["currency"]
+        })
+    return pd.DataFrame(result)
+
+def find_best_match(offer_text, boq_df):
+    for _, row in boq_df.iterrows():
+        if row[0].lower() in offer_text.lower():
+            return row[0]
+    return "Not matched"
+
+def update_sheet_with_offer(worksheet, offer_data):
+    existing = worksheet.get_all_values()
+    start_row = len(existing) + 2
+
+    worksheet.update(f"A{start_row}", [["Поставщик"]])
+    for i, row in enumerate(offer_data):
+        values = [
+            row.get("BOQ Match", ""),
+            row.get("Offered Description", ""),
+            row.get("Unit Price", ""),
+            row.get("Currency", "")
+        ]
+        worksheet.update(f"A{start_row + i + 1}", [values])
