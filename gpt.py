@@ -19,7 +19,7 @@ def translate_text(text):
         return text  # не переводим
 
     response = openai.ChatCompletion.create(
-        model="gpt-4",
+        model="gpt-3.50-turbo-0613",
         messages=[
             {"role": "system", "content": "You are a helpful translator. Translate the following text to English."},
             {"role": "user", "content": text}
