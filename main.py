@@ -52,11 +52,11 @@ def add_project_to_registry(name):
     return True
 
 # === Helper: Create Project Sheet ===
-def create_project_sheet(sheet_title):
+def create_project_sheet(project_name):
     try:
-        sheet = client.open_by_key(TEMPLATE_FILE_ID)
-        sheet.add_worksheet(title=sheet_title, rows="100", cols="20")
-        return sheet.worksheet(sheet_title)
+        spreadsheet = client.open_by_key(TEMPLATE_FILE_ID)
+        spreadsheet.add_worksheet(title=project_name, rows="100", cols="20")
+        return spreadsheet.worksheet(project_name)
     except HttpError as e:
         raise Exception(f"Google Drive Error: {e}")
 
@@ -75,35 +75,32 @@ def handle_docs(message: Message):
         xls = pd.ExcelFile(io.BytesIO(downloaded))
         for sheet_name in xls.sheet_names:
             df = xls.parse(sheet_name)
+            project_name = os.path.splitext(message.document.file_name)[0].strip()
+            full_name = f"{project_name} - {sheet_name}"
+
+            add_project_to_registry(full_name)
+            sheet = create_project_sheet(full_name)
+
             if df.empty:
                 continue
 
-            project_title = f"{os.path.splitext(message.document.file_name)[0].strip()} - {sheet_name}"
-            add_project_to_registry(project_title)
-            sheet = create_project_sheet(project_title)
+            df.columns = [str(c) for c in df.columns]
+            if 'Description' not in df.columns:
+                df.rename(columns={df.columns[1]: 'Description'}, inplace=True)
 
-            # Обработка и перевод
-            if 'Description' in df.columns:
-                df['Description Original'] = df['Description']
-                df['Lang'] = df['Description'].apply(lambda x: 'ru/en' if isinstance(x, str) and (re.search(r'[а-яА-ЯёЁa-zA-Z]', x)) else 'other')
-                df['Description Translated'] = df.apply(lambda row: row['Description Original'] if row['Lang'] == 'ru/en' else translate_and_structure_boq(row['Description Original']) if isinstance(row['Description Original'], str) else '', axis=1)
-                df = df.drop(columns=['Lang'])
-            else:
-                df.columns = ['Description Original'] + list(df.columns[1:])
+            if 'Qty' not in df.columns:
+                df.rename(columns={df.columns[2]: 'Qty'}, inplace=True)
 
-            # Перестройка колонок
-            final_columns = ['Description Original']
-            if 'Description Translated' in df.columns:
-                final_columns.append('Description Translated')
-            if 'Qty' in df.columns:
-                final_columns.append('Qty')
-            if 'Unit' in df.columns:
-                final_columns.append('Unit')
+            if 'Means of Unit' not in df.columns:
+                df.rename(columns={df.columns[3]: 'Means of Unit'}, inplace=True)
 
-            export_df = df[final_columns]
-            sheet.update([export_df.columns.values.tolist()] + export_df.fillna("").astype(str).values.tolist())
+            df['Description Original'] = df['Description']
+            df['Description Translated'] = df['Description'].apply(lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(str(x)))
 
-        bot.send_message(message.chat.id, f"✅ BOQ '{filename}' добавлен в систему (все листы).")
+            output_df = df[['Description Original', 'Description Translated', 'Qty', 'Means of Unit']]
+            sheet.update([output_df.columns.values.tolist()] + output_df.values.tolist())
+
+            bot.send_message(message.chat.id, f"✅ BOQ '{full_name}' добавлен в систему.")
 
     elif filename.endswith(".pdf"):
         projects = read_registry()
@@ -114,7 +111,7 @@ def handle_docs(message: Message):
         user_states[message.chat.id] = 'waiting_for_project_selection'
         pdf_buffer[message.chat.id] = downloaded
 
-        options = [f"{i+1}. {list(p.values())[0]}" for i, p in enumerate(projects)]
+        options = [f"{i+1}. {p[''] if '' in p else list(p.values())[0]}" for i, p in enumerate(projects)]
         bot.send_message(message.chat.id, "📝 Выберите проект для привязки КП:\n" + "\n".join(options))
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == 'waiting_for_project_selection')
@@ -125,12 +122,12 @@ def handle_project_selection(message: Message):
         project_name = list(projects[index].values())[0]
 
         sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(project_name)
-        boq_df = pd.DataFrame(sheet.get_all_values())
+        boq_df = pd.DataFrame(sheet.get_all_values())[1:]
         boq_df.columns = boq_df.iloc[0]
         boq_df = boq_df[1:]
 
-        supplier_name = extract_supplier_name_from_pdf(io.BytesIO(pdf_buffer[message.chat.id]))
         offer_df = compare_offer_with_boq(io.BytesIO(pdf_buffer[message.chat.id]).read().decode(errors="ignore"), boq_df)
+        supplier_name = extract_supplier_name_from_pdf(io.BytesIO(pdf_buffer[message.chat.id]))
 
         start_col = chr(66 + len(sheet.row_values(1)) // 3 * 3)
         sheet.update(f"{start_col}1", [[supplier_name]])
