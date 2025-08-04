@@ -10,7 +10,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
 from telebot.types import Message, InputFile
-from gpt import translate_and_structure_boq, compare_offer_with_boq
+from gpt import translate_and_structure_boq, compare_offer_with_boq, extract_supplier_name_from_pdf
 
 # === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -35,43 +35,34 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_states = {}
 pdf_buffer = {}
 
-# === Helper: Read Registry ===
+# === Registry ===
 def read_registry():
     try:
         sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
-        records = sheet.get_all_records()
-        return records
+        return sheet.get_all_records()
     except Exception as e:
         print("Error reading registry:", e)
         return []
 
-# === Helper: Add to Registry ===
-def add_project_to_registry(name):
-    registry = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
-    existing = registry.col_values(1)
-    if name in existing:
-        return False
-    registry.append_row([name])
-    return True
-
-# === Helper: Create Project Sheet ===
-def create_project_sheet(project_name):
+def add_project_to_registry(project_name):
     try:
-        copied = drive_service.files().copy(
-            fileId=TEMPLATE_FILE_ID,
-            body={"name": project_name}
-        ).execute()
-        file_id = copied["id"]
+        sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
+        sheet.append_row([project_name])
+    except Exception as e:
+        print("Failed to write to registry:", e)
+
+# === Create Sheet ===
+def create_project_sheet(sheet_title):
+    try:
         sheet = client.open_by_key(TEMPLATE_FILE_ID)
-        sheet.add_worksheet(title=project_name, rows="100", cols="20")
-        return sheet.worksheet(project_name)
-    except HttpError as e:
-        raise Exception(f"Google Drive Error: {e}")
+        return sheet.add_worksheet(title=sheet_title, rows="100", cols="20")
+    except Exception as e:
+        raise Exception(f"Ошибка создания листа: {e}")
 
 # === Telegram Handlers ===
 @bot.message_handler(commands=['start'])
 def handle_start(message: Message):
-    bot.send_message(message.chat.id, "👋 Привет! Я бот SupplyPilot.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
+    bot.send_message(message.chat.id, "👋 Привет! Я Вика.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
 
 @bot.message_handler(content_types=['document'])
 def handle_docs(message: Message):
@@ -81,15 +72,22 @@ def handle_docs(message: Message):
 
     if filename.endswith(".xlsx") or filename.endswith(".xls"):
         project_name = os.path.splitext(message.document.file_name)[0].strip()
-        success = add_project_to_registry(project_name)
-        if not success:
-            bot.send_message(message.chat.id, f"⚠️ Проект '{project_name}' уже существует в реестре.")
-            return
 
-        sheet = create_project_sheet(project_name)
-        df = pd.read_excel(io.BytesIO(downloaded))
-        translated_df = translate_and_structure_boq("\n".join(df.iloc[:, 0].astype(str)))
-        sheet.update([translated_df.columns.values.tolist()] + translated_df.values.tolist())
+        xls = pd.ExcelFile(io.BytesIO(downloaded))
+        for sheet_name in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                translated_df = translate_and_structure_boq("\n".join(df.iloc[:, 0].astype(str)))
+
+                title = f"{project_name} - {sheet_name}" if len(xls.sheet_names) > 1 else project_name
+                create_project_sheet(title)
+                add_project_to_registry(title)
+
+                worksheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(title)
+                worksheet.update([translated_df.columns.values.tolist()] + translated_df.values.tolist())
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ Ошибка при обработке листа {sheet_name}: {str(e)}")
+
         bot.send_message(message.chat.id, f"✅ BOQ '{project_name}' добавлен в систему.")
 
     elif filename.endswith(".pdf"):
@@ -112,22 +110,33 @@ def handle_project_selection(message: Message):
         project_name = list(projects[index].values())[0]
 
         sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(project_name)
-        boq_df = pd.DataFrame(sheet.get_all_values())[1:]
+        boq_df = pd.DataFrame(sheet.get_all_values())
         boq_df.columns = boq_df.iloc[0]
         boq_df = boq_df[1:]
 
-        offer_df = compare_offer_with_boq(io.BytesIO(pdf_buffer[message.chat.id]).read().decode(errors="ignore"), boq_df)
+        pdf_bytes = pdf_buffer[message.chat.id]
+        supplier = extract_supplier_name_from_pdf(io.BytesIO(pdf_bytes))
 
-        start_col = chr(66 + len(sheet.row_values(1)) // 3 * 3)
-        sheet.update(f"{start_col}1", [[project_name]])
-        sheet.update(f"{start_col}2", [["Unit Price", "Total Price", "Notes"]])
+        offer_df = compare_offer_with_boq(pdf_bytes.decode(errors="ignore"), boq_df)
+
+        col_start = 1 + len(sheet.row_values(2))
+        sheet.update_cell(1, col_start, supplier)
+        sheet.update_cell(2, col_start, "Unit Price")
+        sheet.update_cell(2, col_start + 1, "Total Price")
+        sheet.update_cell(2, col_start + 2, "Notes")
 
         for i, row in offer_df.iterrows():
             unit_price = float(row['Unit Price']) if row['Unit Price'] else 0
-            qty = float(boq_df[boq_df['BOQ Item'] == row['BOQ Match']]["Qty"].values[0]) if 'Qty' in boq_df.columns else 1
-            total = unit_price * qty
-            note = "✅" if row['BOQ Match'] != "Not matched" else "❗ Not matched"
-            sheet.update(f"{start_col}{i+3}", [[unit_price, total, note]])
+            boq_match = row['BOQ Match']
+            try:
+                qty = float(boq_df.loc[boq_df['BOQ Item'] == boq_match]['Q-ty'].values[0])
+            except:
+                qty = 1
+            total_price = unit_price * qty
+            note = "✅" if row['Notes'] == "Match" else "❗ " + row['Notes']
+            sheet.update_cell(i + 3, col_start, unit_price)
+            sheet.update_cell(i + 3, col_start + 1, total_price)
+            sheet.update_cell(i + 3, col_start + 2, note)
 
         bot.send_message(message.chat.id, f"✅ КП добавлено в проект '{project_name}'.")
         user_states.pop(message.chat.id, None)
