@@ -1,95 +1,94 @@
-# gpt.py
+import re
 import openai
 import pandas as pd
-import re
 import os
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def detect_language(text):
-    if re.search(r'[а-яА-ЯёЁ]', text):
-        return "russian"
-    if re.search(r'[a-zA-Z]', text):
-        return "english"
-    return "other"
-
 def translate_text(text):
-    lang = detect_language(text)
-    if lang in ["russian", "english"]:
-        return ""  # Перевод не требуется
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful translator. Translate the following text to English."},
-            {"role": "user", "content": text}
-        ],
-        temperature=0.2
-    )
-    return response.choices[0].message.content.strip()
+    prompt = f"Translate the following construction-related text to English:\n\n{text}"
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a helpful translator."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
+        return response['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        print("Translation error:", e)
+        return text
 
-def translate_and_structure_boq(df: pd.DataFrame):
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+def detect_boq_structure(df):
+    """
+    Automatically detect column names: Description, Qty, Means of Unit
+    by scanning top rows and content.
+    """
+    detected = {
+        'Description': None,
+        'Qty': None,
+        'Means of Unit': None
+    }
 
-    # Попытка найти колонку Description
-    description_col = None
+    unit_triggers = ['pcs', 'piece', 'unit', 'set', 'm2', 'm3', 'sqm', 'cbm', 'шт', 'компл', 'ədəd', 'dona']
+
     for col in df.columns:
-        if "description" in col.lower():
-            description_col = col
-            break
-    if not description_col:
-        raise ValueError("Не найдена колонка с описанием (description)")
+        col_data = df[col].astype(str).head(10).tolist()
+        col_joined = " ".join(col_data).lower()
 
-    # Генерация переведённой колонки
-    translated = []
-    for val in df[description_col]:
-        if not isinstance(val, str):
-            translated.append("")
+        # Detect Description
+        if detected['Description'] is None and any(len(cell.split()) > 3 for cell in col_data):
+            detected['Description'] = col
             continue
-        lang = detect_language(val)
-        if lang in ["russian", "english"]:
-            translated.append("")
-        else:
-            translated.append(translate_text(val))
 
-    df.insert(df.columns.get_loc(description_col) + 1, "Description Translated", translated)
-    return df
+        # Detect Means of Unit
+        if detected['Means of Unit'] is None and any(any(unit in cell.lower() for unit in unit_triggers) for cell in col_data):
+            detected['Means of Unit'] = col
+            continue
 
-def extract_supplier_offer(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    offers = []
-    for line in lines:
-        match = re.search(r'(\d+(?:\.\d+)?)\s*(USD|EUR|GEL)', line, re.IGNORECASE)
+        # Detect Qty
+        numeric_ratio = sum(cell.replace('.', '', 1).isdigit() for cell in col_data) / len(col_data)
+        if detected['Qty'] is None and numeric_ratio > 0.6:
+            detected['Qty'] = col
+            continue
+
+    return detected
+
+def translate_and_structure_boq(text):
+    try:
+        if re.search(r'[а-яА-Яა-ჰא-תא-תا-ي]', text):
+            return translate_text(text)
+        return text
+    except Exception as e:
+        print("Translation error fallback:", e)
+        return text
+
+def extract_supplier_name_from_pdf(file_bytes):
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(file_bytes)
+        text = ''
+        for page in reader.pages[:2]:
+            text += page.extract_text() or ''
+        # Heuristic: first capitalized phrase that looks like a company name
+        match = re.search(r'\b[A-Z][A-Za-z\s,&\-.()]{3,50}\b', text)
         if match:
-            offers.append({"raw": line, "price": match.group(1), "currency": match.group(2).upper()})
-        else:
-            offers.append({"raw": line, "price": None, "currency": None})
-    return offers
+            return match.group(0).strip()
+        return "Unknown Supplier"
+    except Exception as e:
+        print("PDF name extraction error:", e)
+        return "Unknown Supplier"
 
-def compare_offer_with_boq(text, boq_df):
-    offers = extract_supplier_offer(text)
+def compare_offer_with_boq(pdf_text, boq_df):
+    # Dummy matching logic for demonstration
+    # You will likely replace this with a smarter matching function
+    boq_descriptions = boq_df['Description Original'].astype(str).tolist()
     result = []
-    for offer in offers:
+    for desc in boq_descriptions:
         result.append({
-            "BOQ Match": find_best_match(offer["raw"], boq_df),
-            "Offered Description": offer["raw"],
-            "Unit Price": offer["price"],
-            "Currency": offer["currency"]
+            'BOQ Match': desc,
+            'Unit Price': "",  # To be filled with actual matching logic
         })
     return pd.DataFrame(result)
-
-def find_best_match(offer_text, boq_df):
-    for _, row in boq_df.iterrows():
-        desc = row.get("Description", "")
-        if isinstance(desc, str) and desc.lower() in offer_text.lower():
-            return desc
-    return "Not matched"
-
-def extract_supplier_name_from_pdf(text: str):
-    # Пытаемся извлечь название компании
-    lines = text.splitlines()
-    for line in lines:
-        if any(keyword in line.lower() for keyword in ["ltd", "llc", "gmbh", "company", "co.", "inc", "group"]):
-            return line.strip()
-    # fallback
-    return lines[0].strip() if lines else "Unknown Supplier"
