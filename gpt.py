@@ -3,6 +3,7 @@ import openai
 import pandas as pd
 import re
 import os
+import fitz  # PyMuPDF
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -50,6 +51,12 @@ def extract_supplier_offer(text):
             offers.append({"raw": line, "price": None, "currency": None})
     return offers
 
+def find_best_match(offer_text, boq_df):
+    for _, row in boq_df.iterrows():
+        if row[0].lower() in offer_text.lower():
+            return row[0]
+    return "Not matched"
+
 def compare_offer_with_boq(text, boq_df):
     offers = extract_supplier_offer(text)
     result = []
@@ -61,12 +68,6 @@ def compare_offer_with_boq(text, boq_df):
             "Currency": offer["currency"]
         })
     return pd.DataFrame(result)
-
-def find_best_match(offer_text, boq_df):
-    for _, row in boq_df.iterrows():
-        if row[0].lower() in offer_text.lower():
-            return row[0]
-    return "Not matched"
 
 def update_sheet_with_offer(worksheet, offer_data):
     existing = worksheet.get_all_values()
@@ -81,3 +82,31 @@ def update_sheet_with_offer(worksheet, offer_data):
             row.get("Currency", "")
         ]
         worksheet.update(f"A{start_row + i + 1}", [values])
+
+def extract_supplier_name_from_pdf(pdf_path_or_bytes) -> str:
+    """
+    Простой способ извлечь имя поставщика из первых строк PDF.
+    """
+    try:
+        if isinstance(pdf_path_or_bytes, bytes):
+            doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf")
+        else:
+            doc = fitz.open(pdf_path_or_bytes)
+
+        text = ""
+        for page in doc:
+            text += page.get_text()
+            break  # читаем только первую страницу
+
+        lines = text.splitlines()
+        for line in lines:
+            if any(keyword in line.lower() for keyword in ["supplier", "company", "vendor", "შპს", "ლტდ", "ooo", "llc", "ltd"]):
+                return line.strip()
+        
+        for line in lines:
+            if line.strip():
+                return line.strip()
+
+        return "Unknown Supplier"
+    except Exception:
+        return "Unknown Supplier"
