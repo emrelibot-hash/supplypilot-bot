@@ -1,97 +1,119 @@
 import os
 import io
-import json
-import openai
-import base64
+import re
+import fitz  # PyMuPDF
 import telebot
-import gspread
-import mimetypes
 import pandas as pd
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+import gspread
+from gspread_dataframe import set_with_dataframe
 from oauth2client.service_account import ServiceAccountCredentials
-from dotenv import load_dotenv
-from telebot.types import Message, Document
 
-load_dotenv()
-
+# ENV
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-TEMPLATE_FILE_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
-REGISTRY_SHEET_NAME = "Registry"
 
-openai.api_key = OPENAI_API_KEY
+# Telegram
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Авторизация в Google API
-creds_dict = json.loads(GOOGLE_CREDS_JSON)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    creds_dict,
-    scopes=[
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/spreadsheets",
-    ],
-)
+# Google Sheets Auth
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_dict(eval(GOOGLE_CREDS_JSON), scope)
 client = gspread.authorize(creds)
-drive_service = build("drive", "v3", credentials=creds)
+spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
 
-def ensure_registry():
-    try:
-        return client.open_by_key(GOOGLE_SHEET_ID).worksheet(REGISTRY_SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        sheet = client.open_by_key(GOOGLE_SHEET_ID)
-        return sheet.add_worksheet(title=REGISTRY_SHEET_NAME, rows="100", cols="3")
+# Sheet with project registry
+REGISTRY_SHEET_NAME = "Registry"
 
-def get_next_boq_code():
-    registry = ensure_registry()
-    existing = registry.col_values(1)[1:]  # skip header
-    numbers = [int(row.replace("BOQ-", "")) for row in existing if row.startswith("BOQ-")]
-    next_number = max(numbers, default=0) + 1
-    return f"BOQ-{next_number:03d}"
+# Global session storage
+user_sessions = {}
 
-def copy_template_sheet(new_title):
-    copied_file = drive_service.files().copy(
-        fileId=TEMPLATE_FILE_ID,
-        body={"name": new_title}
-    ).execute()
-    return copied_file["id"]
-@bot.message_handler(commands=["start"])
-def handle_start(message: Message):
-    bot.send_message(
-        message.chat.id,
-        "👋 Привет! Я Вика.\n\n" +
-        "📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ\n\n" +
-        "Все таблицы будут добавлены в Google Sheets автоматически."
-    )
-@bot.message_handler(content_types=["document"])
-def handle_docs(message: Message):
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
+# Language detection and translation helpers (optional)
+def extract_prices(text):
+    matches = re.findall(r'(.*?)\s+(\d+[.,]?\d*)\s*(USD|EUR|GEL)?', text)
+    offers = []
+    for match in matches:
+        description = match[0].strip()
+        price = match[1].replace(',', '.')
+        currency = match[2] or 'USD'
+        offers.append((description, float(price), currency))
+    return offers
 
-        mime_type, _ = mimetypes.guess_type(message.document.file_name)
+# Handlers
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    bot.send_message(message.chat.id, "👋 Привет! Отправь Excel с BOQ или PDF с КП. Всё остальное я сделаю сам.")
 
-        if message.document.file_name.endswith(".xlsx"):
-            boq_code = get_next_boq_code()
-            new_sheet_id = copy_template_sheet(boq_code)
+@bot.message_handler(content_types=['document'])
+def handle_docs(message):
+    file_info = bot.get_file(message.document.file_id)
+    file = bot.download_file(file_info.file_path)
 
-            registry = ensure_registry()
-            registry.append_row([boq_code, new_sheet_id, message.document.file_name])
-
-            bot.reply_to(message, f"✅ BOQ-файл получен и добавлен как проект *{boq_code}*.", parse_mode="Markdown")
-
-        elif message.document.file_name.endswith(".pdf"):
-            bot.reply_to(message, "📌 Ваша PDF получена. Сейчас запрошу, к какому проекту её привязать...")
-            # Здесь должна быть логика выбора проекта
-
+    if message.document.file_name.endswith(".pdf"):
+        text = extract_text_from_pdf(file)
+        user_sessions[message.chat.id] = {'pdf_text': text}
+        ask_project_selection(message)
+    elif message.document.file_name.endswith(".xlsx"):
+        df = pd.read_excel(io.BytesIO(file))
+        boq_code = df.columns[0]
+        if boq_code not in [ws.title for ws in spreadsheet.worksheets()]:
+            new_ws = spreadsheet.add_worksheet(title=boq_code, rows="100", cols="20")
         else:
-            bot.reply_to(message, "⚠️ Поддерживаются только файлы Excel (.xlsx) и PDF.")
+            new_ws = spreadsheet.worksheet(boq_code)
+        set_with_dataframe(new_ws, df)
+        register_project(boq_code)
+        bot.send_message(message.chat.id, f"✅ BOQ '{boq_code}' добавлен в систему.")
+    else:
+        bot.send_message(message.chat.id, "❌ Поддерживаются только PDF и Excel-файлы.")
 
-    except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {e}")
+def extract_text_from_pdf(file_bytes):
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        return "\n".join(page.get_text() for page in doc)
 
-if __name__ == "__main__":
-    print("Бот запущен")
-    bot.infinity_polling()
+def ask_project_selection(message):
+    registry = spreadsheet.worksheet(REGISTRY_SHEET_NAME).get_all_records()
+    if not registry:
+        bot.send_message(message.chat.id, "❌ Нет доступных проектов. Сначала загрузите BOQ.")
+        return
+    text = "📋 В какой проект загрузить это КП?\n"
+    for idx, row in enumerate(registry, 1):
+        text += f"{idx}. {row['Code']} – {row['Name']}\n"
+    bot.send_message(message.chat.id, text)
+    bot.register_next_step_handler(message, handle_project_selection)
+
+def handle_project_selection(message):
+    selection = message.text.strip()
+    registry_ws = spreadsheet.worksheet(REGISTRY_SHEET_NAME)
+    registry = registry_ws.get_all_records()
+
+    selected = None
+    for idx, row in enumerate(registry, 1):
+        if selection == str(idx) or selection.lower() in row['Name'].lower():
+            selected = row
+            break
+
+    if not selected:
+        bot.send_message(message.chat.id, "❌ Не удалось найти проект. Попробуйте снова.")
+        return ask_project_selection(message)
+
+    boq_code = selected['Code']
+    boq_ws = spreadsheet.worksheet(boq_code)
+
+    text = user_sessions[message.chat.id]['pdf_text']
+    offers = extract_prices(text)
+
+    start_row = len(boq_ws.get_all_values()) + 2
+    boq_ws.update(f"A{start_row}", [[f"Supplier: from PDF"]])
+    for i, (desc, price, currency) in enumerate(offers):
+        boq_ws.update(f"A{start_row + i + 1}", [[desc, price, price, currency]])
+
+    bot.send_message(message.chat.id, f"✅ КП добавлено в проект '{boq_code}'.")
+
+def register_project(code):
+    registry_ws = spreadsheet.worksheet(REGISTRY_SHEET_NAME)
+    all_rows = registry_ws.get_all_values()
+    existing_codes = [row[0] for row in all_rows[1:]] if len(all_rows) > 1 else []
+    if code not in existing_codes:
+        registry_ws.append_row([code, f"Project {code}"])
+
+bot.polling()
