@@ -78,12 +78,13 @@ def handle_docs(message):
                 continue
 
             structure = detect_boq_structure(df)
-            if not structure['Description'] or not structure['Qty'] or not structure['Means of Unit']:
-                continue
+            df = structure["df"]
+            desc_col = structure["description_column"]
+            qty_col = structure["qty_column"]
+            unit_col = structure["unit_column"]
 
-            desc_col = structure['Description']
-            qty_col = structure['Qty']
-            unit_col = structure['Means of Unit']
+            if not desc_col or not qty_col or not unit_col:
+                continue
 
             sub_df = df[[desc_col, qty_col, unit_col]].copy()
             sub_df.columns = ['Description Original', 'Qty', 'Means of Unit']
