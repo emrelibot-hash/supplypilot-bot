@@ -49,9 +49,7 @@ def read_registry():
 # === Helper: Add to Registry ===
 def add_project_to_registry(name):
     registry = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
-    current_names = [r[0] for r in registry.get_all_values() if r]
-    if name not in current_names:
-        registry.append_row([name])
+    registry.append_row([name])
     return True
 
 # === Helper: Create Project Sheet ===
@@ -66,7 +64,7 @@ def create_project_sheet(project_name):
 # === Telegram Handlers ===
 @bot.message_handler(commands=['start'])
 def handle_start(message: Message):
-    bot.send_message(message.chat.id, "👋 Привет! Я бот SupplyPilot.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
+    bot.send_message(message.chat.id, "👋 Привет! Я бот SupplyPilot.\n\n📅 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
 
 @bot.message_handler(content_types=['document'])
 def handle_docs(message: Message):
@@ -88,10 +86,19 @@ def handle_docs(message: Message):
                 continue
 
             df.columns = [str(c) for c in df.columns]
-            df = detect_boq_structure(df)
+            structure = detect_boq_structure(df)
 
-            df['Description Original'] = df['Description']
-            df['Description Translated'] = df['Description'].apply(lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(str(x)))
+            desc_col = structure['Description']
+            qty_col = structure['Qty']
+            unit_col = structure['Means of Unit']
+
+            df['Description Original'] = df[desc_col]
+            df['Description Translated'] = df['Description Original'].apply(
+                lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(str(x))
+            )
+
+            df['Qty'] = df[qty_col]
+            df['Means of Unit'] = df[unit_col]
 
             output_df = df[['Description Original', 'Description Translated', 'Qty', 'Means of Unit']]
             sheet.update([output_df.columns.values.tolist()] + output_df.values.tolist())
@@ -108,7 +115,7 @@ def handle_docs(message: Message):
         pdf_buffer[message.chat.id] = downloaded
 
         options = [f"{i+1}. {p[''] if '' in p else list(p.values())[0]}" for i, p in enumerate(projects)]
-        bot.send_message(message.chat.id, "📝 Выберите проект для привязки КП:\n" + "\n".join(options))
+        bot.send_message(message.chat.id, "📜 Выберите проект для привязки КП:\n" + "\n".join(options))
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == 'waiting_for_project_selection')
 def handle_project_selection(message: Message):
@@ -118,7 +125,7 @@ def handle_project_selection(message: Message):
         project_name = list(projects[index].values())[0]
 
         sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(project_name)
-        boq_df = pd.DataFrame(sheet.get_all_values())
+        boq_df = pd.DataFrame(sheet.get_all_values())[1:]
         boq_df.columns = boq_df.iloc[0]
         boq_df = boq_df[1:]
 
@@ -131,7 +138,7 @@ def handle_project_selection(message: Message):
 
         for i, row in offer_df.iterrows():
             unit_price = float(row['Unit Price']) if row['Unit Price'] else 0
-            qty = float(boq_df[boq_df['Description Original'] == row['BOQ Match']]["Qty"].values[0]) if 'Qty' in boq_df.columns else 1
+            qty = float(boq_df[boq_df['BOQ Item'] == row['BOQ Match']]["Qty"].values[0]) if 'Qty' in boq_df.columns else 1
             total = unit_price * qty
             note = "✅" if row['BOQ Match'] != "Not matched" else "❗ Not matched"
             sheet.update(f"{start_col}{i+3}", [[unit_price, total, note]])
