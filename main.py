@@ -52,18 +52,18 @@ def add_project_to_registry(name):
     return True
 
 # === Helper: Create Project Sheet ===
-def create_project_sheet(project_name):
+def create_project_sheet(sheet_title):
     try:
         sheet = client.open_by_key(TEMPLATE_FILE_ID)
-        sheet.add_worksheet(title=project_name, rows="100", cols="20")
-        return sheet.worksheet(project_name)
+        sheet.add_worksheet(title=sheet_title, rows="100", cols="20")
+        return sheet.worksheet(sheet_title)
     except HttpError as e:
         raise Exception(f"Google Drive Error: {e}")
 
 # === Telegram Handlers ===
 @bot.message_handler(commands=['start'])
 def handle_start(message: Message):
-    bot.send_message(message.chat.id, "👋 Привет! Я Вика.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
+    bot.send_message(message.chat.id, "👋 Привет! Я бот SupplyPilot.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
 
 @bot.message_handler(content_types=['document'])
 def handle_docs(message: Message):
@@ -75,13 +75,35 @@ def handle_docs(message: Message):
         xls = pd.ExcelFile(io.BytesIO(downloaded))
         for sheet_name in xls.sheet_names:
             df = xls.parse(sheet_name)
-            project_name = sheet_name.strip()
+            if df.empty:
+                continue
 
-            add_project_to_registry(project_name)
-            sheet = create_project_sheet(project_name)
-            translated_df = translate_and_structure_boq(df)
-            sheet.update([translated_df.columns.values.tolist()] + translated_df.values.tolist())
-        bot.send_message(message.chat.id, f"✅ BOQ добавлен в систему.")
+            project_title = f"{os.path.splitext(message.document.file_name)[0].strip()} - {sheet_name}"
+            add_project_to_registry(project_title)
+            sheet = create_project_sheet(project_title)
+
+            # Обработка и перевод
+            if 'Description' in df.columns:
+                df['Description Original'] = df['Description']
+                df['Lang'] = df['Description'].apply(lambda x: 'ru/en' if isinstance(x, str) and (re.search(r'[а-яА-ЯёЁa-zA-Z]', x)) else 'other')
+                df['Description Translated'] = df.apply(lambda row: row['Description Original'] if row['Lang'] == 'ru/en' else translate_and_structure_boq(row['Description Original']) if isinstance(row['Description Original'], str) else '', axis=1)
+                df = df.drop(columns=['Lang'])
+            else:
+                df.columns = ['Description Original'] + list(df.columns[1:])
+
+            # Перестройка колонок
+            final_columns = ['Description Original']
+            if 'Description Translated' in df.columns:
+                final_columns.append('Description Translated')
+            if 'Qty' in df.columns:
+                final_columns.append('Qty')
+            if 'Unit' in df.columns:
+                final_columns.append('Unit')
+
+            export_df = df[final_columns]
+            sheet.update([export_df.columns.values.tolist()] + export_df.fillna("").astype(str).values.tolist())
+
+        bot.send_message(message.chat.id, f"✅ BOQ '{filename}' добавлен в систему (все листы).")
 
     elif filename.endswith(".pdf"):
         projects = read_registry()
@@ -92,7 +114,7 @@ def handle_docs(message: Message):
         user_states[message.chat.id] = 'waiting_for_project_selection'
         pdf_buffer[message.chat.id] = downloaded
 
-        options = [f"{i+1}. {p[''] if '' in p else list(p.values())[0]}" for i, p in enumerate(projects)]
+        options = [f"{i+1}. {list(p.values())[0]}" for i, p in enumerate(projects)]
         bot.send_message(message.chat.id, "📝 Выберите проект для привязки КП:\n" + "\n".join(options))
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == 'waiting_for_project_selection')
@@ -103,16 +125,15 @@ def handle_project_selection(message: Message):
         project_name = list(projects[index].values())[0]
 
         sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(project_name)
-        boq_df = pd.DataFrame(sheet.get_all_values())[1:]
+        boq_df = pd.DataFrame(sheet.get_all_values())
         boq_df.columns = boq_df.iloc[0]
         boq_df = boq_df[1:]
 
-        offer_text = io.BytesIO(pdf_buffer[message.chat.id]).read().decode(errors="ignore")
-        offer_df = compare_offer_with_boq(offer_text, boq_df)
-        supplier = extract_supplier_name_from_pdf(offer_text)
+        supplier_name = extract_supplier_name_from_pdf(io.BytesIO(pdf_buffer[message.chat.id]))
+        offer_df = compare_offer_with_boq(io.BytesIO(pdf_buffer[message.chat.id]).read().decode(errors="ignore"), boq_df)
 
         start_col = chr(66 + len(sheet.row_values(1)) // 3 * 3)
-        sheet.update(f"{start_col}1", [[supplier]])
+        sheet.update(f"{start_col}1", [[supplier_name]])
         sheet.update(f"{start_col}2", [["Unit Price", "Total Price", "Notes"]])
 
         for i, row in offer_df.iterrows():
