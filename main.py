@@ -1,119 +1,141 @@
 import os
 import io
-import re
-import fitz  # PyMuPDF
 import telebot
-import pandas as pd
+import openai
 import gspread
-from gspread_dataframe import set_with_dataframe
-from oauth2client.service_account import ServiceAccountCredentials
+import base64
+import json
+import pandas as pd
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.oauth2.service_account import Credentials
+from telebot.types import Message, InputFile
+from gpt import translate_and_structure_boq, compare_offer_with_boq
 
-# ENV
+# === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TEMPLATE_FILE_ID = os.getenv("GOOGLE_SHEET_ID")
+REGISTRY_SHEET_NAME = os.getenv("REGISTRY_SHEET_NAME", "Registry")
 
-# Telegram
+# === Google Auth ===
+creds_json = os.getenv("GOOGLE_CREDS_JSON")
+creds_dict = json.loads(creds_json)
+creds = Credentials.from_service_account_info(creds_dict, scopes=[
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets'
+])
+client = gspread.authorize(creds)
+drive_service = build('drive', 'v3', credentials=creds)
+
+# === Telegram Init ===
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Google Sheets Auth
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(eval(GOOGLE_CREDS_JSON), scope)
-client = gspread.authorize(creds)
-spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+# === Bot State ===
+user_states = {}
+pdf_buffer = {}
 
-# Sheet with project registry
-REGISTRY_SHEET_NAME = "Registry"
+# === Helper: Read Registry ===
+def read_registry():
+    try:
+        sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
+        records = sheet.get_all_records()
+        return records
+    except Exception as e:
+        print("Error reading registry:", e)
+        return []
 
-# Global session storage
-user_sessions = {}
+# === Helper: Add to Registry ===
+def add_project_to_registry(name):
+    registry = client.open_by_key(TEMPLATE_FILE_ID).worksheet(REGISTRY_SHEET_NAME)
+    existing = registry.col_values(1)
+    if name in existing:
+        return False
+    registry.append_row([name])
+    return True
 
-# Language detection and translation helpers (optional)
-def extract_prices(text):
-    matches = re.findall(r'(.*?)\s+(\d+[.,]?\d*)\s*(USD|EUR|GEL)?', text)
-    offers = []
-    for match in matches:
-        description = match[0].strip()
-        price = match[1].replace(',', '.')
-        currency = match[2] or 'USD'
-        offers.append((description, float(price), currency))
-    return offers
+# === Helper: Create Project Sheet ===
+def create_project_sheet(project_name):
+    try:
+        copied = drive_service.files().copy(
+            fileId=TEMPLATE_FILE_ID,
+            body={"name": project_name}
+        ).execute()
+        file_id = copied["id"]
+        sheet = client.open_by_key(TEMPLATE_FILE_ID)
+        sheet.add_worksheet(title=project_name, rows="100", cols="20")
+        return sheet.worksheet(project_name)
+    except HttpError as e:
+        raise Exception(f"Google Drive Error: {e}")
 
-# Handlers
+# === Telegram Handlers ===
 @bot.message_handler(commands=['start'])
-def start_handler(message):
-    bot.send_message(message.chat.id, "👋 Привет! Отправь Excel с BOQ или PDF с КП. Всё остальное я сделаю сам.")
+def handle_start(message: Message):
+    bot.send_message(message.chat.id, "👋 Привет! Я бот SupplyPilot.\n\n📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ")
 
 @bot.message_handler(content_types=['document'])
-def handle_docs(message):
+def handle_docs(message: Message):
     file_info = bot.get_file(message.document.file_id)
-    file = bot.download_file(file_info.file_path)
+    downloaded = bot.download_file(file_info.file_path)
+    filename = message.document.file_name.lower()
 
-    if message.document.file_name.endswith(".pdf"):
-        text = extract_text_from_pdf(file)
-        user_sessions[message.chat.id] = {'pdf_text': text}
-        ask_project_selection(message)
-    elif message.document.file_name.endswith(".xlsx"):
-        df = pd.read_excel(io.BytesIO(file))
-        boq_code = df.columns[0]
-        if boq_code not in [ws.title for ws in spreadsheet.worksheets()]:
-            new_ws = spreadsheet.add_worksheet(title=boq_code, rows="100", cols="20")
-        else:
-            new_ws = spreadsheet.worksheet(boq_code)
-        set_with_dataframe(new_ws, df)
-        register_project(boq_code)
-        bot.send_message(message.chat.id, f"✅ BOQ '{boq_code}' добавлен в систему.")
-    else:
-        bot.send_message(message.chat.id, "❌ Поддерживаются только PDF и Excel-файлы.")
+    if filename.endswith(".xlsx") or filename.endswith(".xls"):
+        project_name = os.path.splitext(message.document.file_name)[0].strip()
+        success = add_project_to_registry(project_name)
+        if not success:
+            bot.send_message(message.chat.id, f"⚠️ Проект '{project_name}' уже существует в реестре.")
+            return
 
-def extract_text_from_pdf(file_bytes):
-    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-        return "\n".join(page.get_text() for page in doc)
+        sheet = create_project_sheet(project_name)
+        df = pd.read_excel(io.BytesIO(downloaded))
+        translated_df = translate_and_structure_boq("\n".join(df.iloc[:, 0].astype(str)))
+        sheet.update([translated_df.columns.values.tolist()] + translated_df.values.tolist())
+        bot.send_message(message.chat.id, f"✅ BOQ '{project_name}' добавлен в систему.")
 
-def ask_project_selection(message):
-    registry = spreadsheet.worksheet(REGISTRY_SHEET_NAME).get_all_records()
-    if not registry:
-        bot.send_message(message.chat.id, "❌ Нет доступных проектов. Сначала загрузите BOQ.")
-        return
-    text = "📋 В какой проект загрузить это КП?\n"
-    for idx, row in enumerate(registry, 1):
-        text += f"{idx}. {row['Code']} – {row['Name']}\n"
-    bot.send_message(message.chat.id, text)
-    bot.register_next_step_handler(message, handle_project_selection)
+    elif filename.endswith(".pdf"):
+        projects = read_registry()
+        if not projects:
+            bot.send_message(message.chat.id, "❌ Нет доступных проектов. Сначала загрузите BOQ.")
+            return
 
-def handle_project_selection(message):
-    selection = message.text.strip()
-    registry_ws = spreadsheet.worksheet(REGISTRY_SHEET_NAME)
-    registry = registry_ws.get_all_records()
+        user_states[message.chat.id] = 'waiting_for_project_selection'
+        pdf_buffer[message.chat.id] = downloaded
 
-    selected = None
-    for idx, row in enumerate(registry, 1):
-        if selection == str(idx) or selection.lower() in row['Name'].lower():
-            selected = row
-            break
+        options = [f"{i+1}. {p[''] if '' in p else list(p.values())[0]}" for i, p in enumerate(projects)]
+        bot.send_message(message.chat.id, "📝 Выберите проект для привязки КП:\n" + "\n".join(options))
 
-    if not selected:
-        bot.send_message(message.chat.id, "❌ Не удалось найти проект. Попробуйте снова.")
-        return ask_project_selection(message)
+@bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == 'waiting_for_project_selection')
+def handle_project_selection(message: Message):
+    try:
+        index = int(message.text.strip()) - 1
+        projects = read_registry()
+        project_name = list(projects[index].values())[0]
 
-    boq_code = selected['Code']
-    boq_ws = spreadsheet.worksheet(boq_code)
+        sheet = client.open_by_key(TEMPLATE_FILE_ID).worksheet(project_name)
+        boq_df = pd.DataFrame(sheet.get_all_values())[1:]
+        boq_df.columns = boq_df.iloc[0]
+        boq_df = boq_df[1:]
 
-    text = user_sessions[message.chat.id]['pdf_text']
-    offers = extract_prices(text)
+        offer_df = compare_offer_with_boq(io.BytesIO(pdf_buffer[message.chat.id]).read().decode(errors="ignore"), boq_df)
 
-    start_row = len(boq_ws.get_all_values()) + 2
-    boq_ws.update(f"A{start_row}", [[f"Supplier: from PDF"]])
-    for i, (desc, price, currency) in enumerate(offers):
-        boq_ws.update(f"A{start_row + i + 1}", [[desc, price, price, currency]])
+        start_col = chr(66 + len(sheet.row_values(1)) // 3 * 3)
+        sheet.update(f"{start_col}1", [[project_name]])
+        sheet.update(f"{start_col}2", [["Unit Price", "Total Price", "Notes"]])
 
-    bot.send_message(message.chat.id, f"✅ КП добавлено в проект '{boq_code}'.")
+        for i, row in offer_df.iterrows():
+            unit_price = float(row['Unit Price']) if row['Unit Price'] else 0
+            qty = float(boq_df[boq_df['BOQ Item'] == row['BOQ Match']]["Qty"].values[0]) if 'Qty' in boq_df.columns else 1
+            total = unit_price * qty
+            note = "✅" if row['BOQ Match'] != "Not matched" else "❗ Not matched"
+            sheet.update(f"{start_col}{i+3}", [[unit_price, total, note]])
 
-def register_project(code):
-    registry_ws = spreadsheet.worksheet(REGISTRY_SHEET_NAME)
-    all_rows = registry_ws.get_all_values()
-    existing_codes = [row[0] for row in all_rows[1:]] if len(all_rows) > 1 else []
-    if code not in existing_codes:
-        registry_ws.append_row([code, f"Project {code}"])
+        bot.send_message(message.chat.id, f"✅ КП добавлено в проект '{project_name}'.")
+        user_states.pop(message.chat.id, None)
+        pdf_buffer.pop(message.chat.id, None)
 
-bot.polling()
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+
+# === Start Polling ===
+print("🤖 Бот запущен...")
+bot.infinity_polling()
