@@ -10,6 +10,7 @@ from gpt import extract_supplier_name_from_pdf
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+print("LOADED TOKEN:", BOT_TOKEN)
 bot = telebot.TeleBot(BOT_TOKEN)
 SPREADSHEET_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
 TEMPLATE_SHEET = "Template"
