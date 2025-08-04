@@ -3,7 +3,6 @@ import openai
 import pandas as pd
 import re
 import os
-import fitz  # PyMuPDF
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -17,8 +16,7 @@ def detect_language(text):
 def translate_text(text):
     lang = detect_language(text)
     if lang in ["russian", "english"]:
-        return text  # не переводим
-
+        return ""  # Перевод не требуется
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -29,15 +27,32 @@ def translate_text(text):
     )
     return response.choices[0].message.content.strip()
 
-def translate_and_structure_boq(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    structured_rows = []
+def translate_and_structure_boq(df: pd.DataFrame):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-    for line in lines:
-        translated = translate_text(line)
-        structured_rows.append([translated])
+    # Попытка найти колонку Description
+    description_col = None
+    for col in df.columns:
+        if "description" in col.lower():
+            description_col = col
+            break
+    if not description_col:
+        raise ValueError("Не найдена колонка с описанием (description)")
 
-    df = pd.DataFrame(structured_rows, columns=["BOQ Item"])
+    # Генерация переведённой колонки
+    translated = []
+    for val in df[description_col]:
+        if not isinstance(val, str):
+            translated.append("")
+            continue
+        lang = detect_language(val)
+        if lang in ["russian", "english"]:
+            translated.append("")
+        else:
+            translated.append(translate_text(val))
+
+    df.insert(df.columns.get_loc(description_col) + 1, "Description Translated", translated)
     return df
 
 def extract_supplier_offer(text):
@@ -51,12 +66,6 @@ def extract_supplier_offer(text):
             offers.append({"raw": line, "price": None, "currency": None})
     return offers
 
-def find_best_match(offer_text, boq_df):
-    for _, row in boq_df.iterrows():
-        if row[0].lower() in offer_text.lower():
-            return row[0]
-    return "Not matched"
-
 def compare_offer_with_boq(text, boq_df):
     offers = extract_supplier_offer(text)
     result = []
@@ -69,44 +78,18 @@ def compare_offer_with_boq(text, boq_df):
         })
     return pd.DataFrame(result)
 
-def update_sheet_with_offer(worksheet, offer_data):
-    existing = worksheet.get_all_values()
-    start_row = len(existing) + 2
+def find_best_match(offer_text, boq_df):
+    for _, row in boq_df.iterrows():
+        desc = row.get("Description", "")
+        if isinstance(desc, str) and desc.lower() in offer_text.lower():
+            return desc
+    return "Not matched"
 
-    worksheet.update(f"A{start_row}", [["Поставщик"]])
-    for i, row in enumerate(offer_data):
-        values = [
-            row.get("BOQ Match", ""),
-            row.get("Offered Description", ""),
-            row.get("Unit Price", ""),
-            row.get("Currency", "")
-        ]
-        worksheet.update(f"A{start_row + i + 1}", [values])
-
-def extract_supplier_name_from_pdf(pdf_path_or_bytes) -> str:
-    """
-    Простой способ извлечь имя поставщика из первых строк PDF.
-    """
-    try:
-        if isinstance(pdf_path_or_bytes, bytes):
-            doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf")
-        else:
-            doc = fitz.open(pdf_path_or_bytes)
-
-        text = ""
-        for page in doc:
-            text += page.get_text()
-            break  # читаем только первую страницу
-
-        lines = text.splitlines()
-        for line in lines:
-            if any(keyword in line.lower() for keyword in ["supplier", "company", "vendor", "შპს", "ლტდ", "ooo", "llc", "ltd"]):
-                return line.strip()
-        
-        for line in lines:
-            if line.strip():
-                return line.strip()
-
-        return "Unknown Supplier"
-    except Exception:
-        return "Unknown Supplier"
+def extract_supplier_name_from_pdf(text: str):
+    # Пытаемся извлечь название компании
+    lines = text.splitlines()
+    for line in lines:
+        if any(keyword in line.lower() for keyword in ["ltd", "llc", "gmbh", "company", "co.", "inc", "group"]):
+            return line.strip()
+    # fallback
+    return lines[0].strip() if lines else "Unknown Supplier"
