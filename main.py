@@ -3,17 +3,15 @@ import os
 import pandas as pd
 import tempfile
 import re
-from gpt import detect_boq_structure
+from gpt import translate_text, detect_boq_structure, extract_supplier_name_from_pdf
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from gpt import extract_supplier_name_from_pdf
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 print("LOADED TOKEN:", BOT_TOKEN)
 bot = telebot.TeleBot(BOT_TOKEN)
 SPREADSHEET_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
-TEMPLATE_SHEET = "Template"
 
 # === GOOGLE API SETUP ===
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
@@ -27,18 +25,19 @@ def add_project_to_registry(project_name):
     registry_range = "Registry!A:A"
     existing = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=registry_range).execute().get("values", [])
     existing_flat = [r[0] for r in existing]
-    sheet.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Registry!A:B",
-        valueInputOption="RAW",
-        body={"values": [[project_name, project_name]]}
-    ).execute()
+    if project_name not in existing_flat:
+        sheet.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Registry!A:B",
+            valueInputOption="RAW",
+            body={"values": [[project_name, project_name]]}
+        ).execute()
 
 def create_project_sheet(project_name):
     sheet_body = {
         "requests": [{
             "addSheet": {
-                "properties": {"title": project_name[:100]}  # title max 100 chars
+                "properties": {"title": project_name[:100]}
             }
         }]
     }
@@ -78,19 +77,18 @@ def handle_docs(message):
                 continue
 
             structure = detect_boq_structure(df)
-            df = structure["df"]
-            desc_col = structure["description_column"]
-            qty_col = structure["qty_column"]
-            unit_col = structure["unit_column"]
+            desc_col = structure['description_column']
+            qty_col = structure['qty_column']
+            unit_col = structure['unit_column']
 
             if not desc_col or not qty_col or not unit_col:
                 continue
 
-            sub_df = df[[desc_col, qty_col, unit_col]].copy()
+            sub_df = structure['df'][[desc_col, qty_col, unit_col]].copy()
             sub_df.columns = ['Description Original', 'Qty', 'Means of Unit']
 
             sub_df['Description Translated'] = sub_df['Description Original'].apply(
-                lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(str(x))
+                lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_text(str(x))
             )
 
             all_data = pd.concat([all_data, sub_df], ignore_index=True)
