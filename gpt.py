@@ -1,94 +1,87 @@
-import re
-import openai
 import pandas as pd
+import re
+import PyPDF2
+import openai
 import os
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def translate_text(text):
-    prompt = f"Translate the following construction-related text to English:\n\n{text}"
+def clean_column_name(col):
+    if isinstance(col, tuple):
+        return " / ".join(str(c) for c in col if pd.notnull(c)).strip()
+    if isinstance(col, str):
+        return col.strip()
+    return str(col)
+
+def find_first_data_row(df):
+    for i, row in df.iterrows():
+        non_empty = row.dropna()
+        if len(non_empty) >= 2 and any(isinstance(v, str) and v.strip() for v in non_empty):
+            return i
+    return 0
+
+def detect_boq_structure(df: pd.DataFrame):
+    start_row = find_first_data_row(df)
+    df = df.iloc[start_row:].reset_index(drop=True)
+
+    header_rows = 2 if all(df.iloc[0].notnull()) and all(df.iloc[1].notnull()) else 1
+    df.columns = pd.MultiIndex.from_arrays(df.iloc[:header_rows].values) if header_rows == 2 else df.iloc[0].values
+    df.columns = [clean_column_name(col) for col in df.columns]
+    df = df.iloc[header_rows:].reset_index(drop=True)
+
+    desc_col, qty_col, unit_col = None, None, None
+
+    for col in df.columns:
+        col_lc = str(col).lower()
+        if any(x in col_lc for x in ["description", "work", "item", "наименование"]):
+            desc_col = col
+        elif any(x in col_lc for x in ["qty", "quantity", "amount", "რაოდენობა", "кол-во"]):
+            qty_col = col
+        elif any(x in col_lc for x in ["unit", "measure", "ed.", "ერთეული", "мера"]):
+            unit_col = col
+
+    if not qty_col:
+        for col in df.columns:
+            if pd.to_numeric(df[col], errors='coerce').notnull().sum() > 0:
+                qty_col = col
+                break
+
+    if not unit_col:
+        for col in df.columns:
+            if df[col].astype(str).str.lower().str.contains(r"\\b(m2|m3|pcs|set|piece|თვე|ცალი)\\b", regex=True).sum() > 0:
+                unit_col = col
+                break
+
+    return {
+        "df": df,
+        "description_column": desc_col,
+        "qty_column": qty_col,
+        "unit_column": unit_col
+    }
+
+def translate_text(text: str, target_language='en') -> str:
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a helpful translator."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2
+                {"role": "system", "content": f"Translate to {target_language}. Only translated result, nothing else."},
+                {"role": "user", "content": text}
+            ]
         )
-        return response['choices'][0]['message']['content'].strip()
+        return response.choices[0].message['content'].strip()
     except Exception as e:
-        print("Translation error:", e)
         return text
 
-def detect_boq_structure(df):
-    """
-    Automatically detect column names: Description, Qty, Means of Unit
-    by scanning top rows and content.
-    """
-    detected = {
-        'Description': None,
-        'Qty': None,
-        'Means of Unit': None
-    }
-
-    unit_triggers = ['pcs', 'piece', 'unit', 'set', 'm2', 'm3', 'sqm', 'cbm', 'шт', 'компл', 'ədəd', 'dona']
-
-    for col in df.columns:
-        col_data = df[col].astype(str).head(10).tolist()
-        col_joined = " ".join(col_data).lower()
-
-        # Detect Description
-        if detected['Description'] is None and any(len(cell.split()) > 3 for cell in col_data):
-            detected['Description'] = col
-            continue
-
-        # Detect Means of Unit
-        if detected['Means of Unit'] is None and any(any(unit in cell.lower() for unit in unit_triggers) for cell in col_data):
-            detected['Means of Unit'] = col
-            continue
-
-        # Detect Qty
-        numeric_ratio = sum(cell.replace('.', '', 1).isdigit() for cell in col_data) / len(col_data)
-        if detected['Qty'] is None and numeric_ratio > 0.6:
-            detected['Qty'] = col
-            continue
-
-    return detected
-
-def translate_and_structure_boq(text):
+def extract_supplier_name_from_pdf(pdf_path: str) -> str:
     try:
-        if re.search(r'[а-яА-Яა-ჰא-תא-תا-ي]', text):
-            return translate_text(text)
-        return text
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            first_page = reader.pages[0]
+            text = first_page.extract_text()
+            match = re.search(r"Supplier[:\s]+(.+?)\n", text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            else:
+                return "Unknown Supplier"
     except Exception as e:
-        print("Translation error fallback:", e)
-        return text
-
-def extract_supplier_name_from_pdf(file_bytes):
-    try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(file_bytes)
-        text = ''
-        for page in reader.pages[:2]:
-            text += page.extract_text() or ''
-        # Heuristic: first capitalized phrase that looks like a company name
-        match = re.search(r'\b[A-Z][A-Za-z\s,&\-.()]{3,50}\b', text)
-        if match:
-            return match.group(0).strip()
         return "Unknown Supplier"
-    except Exception as e:
-        print("PDF name extraction error:", e)
-        return "Unknown Supplier"
-
-def compare_offer_with_boq(pdf_text, boq_df):
-    # Dummy matching logic for demonstration
-    # You will likely replace this with a smarter matching function
-    boq_descriptions = boq_df['Description Original'].astype(str).tolist()
-    result = []
-    for desc in boq_descriptions:
-        result.append({
-            'BOQ Match': desc,
-            'Unit Price': "",  # To be filled with actual matching logic
-        })
-    return pd.DataFrame(result)
