@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import tempfile
 import re
-from gpt import translate_and_structure_boq, detect_boq_structure
+from gpt import detect_boq_structure
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from gpt import extract_supplier_name_from_pdf
