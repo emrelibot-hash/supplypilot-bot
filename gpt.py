@@ -3,6 +3,7 @@ import re
 import PyPDF2
 import openai
 import os
+import json
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -20,49 +21,48 @@ def find_first_data_row(df):
             return i
     return 0
 
-def detect_boq_structure(df: pd.DataFrame):
-    start_row = find_first_data_row(df)
-    df = df.iloc[start_row:].reset_index(drop=True)
+def detect_boq_structure_with_gpt(df: pd.DataFrame):
+    content_preview = df.head(20).to_csv(index=False)
+    prompt = f"""
+You are a procurement assistant. Below is a table extracted from an Excel BOQ file. Your job is to determine which columns represent:
+- Description (name of the item)
+- Quantity (number of units required)
+- Unit (unit of measure like pcs, m2, etc.)
 
-    header_rows = 2 if all(df.iloc[0].notnull()) and all(df.iloc[1].notnull()) else 1
-    df.columns = pd.MultiIndex.from_arrays(df.iloc[:header_rows].values) if header_rows == 2 else df.iloc[0].values
-    df.columns = [clean_column_name(col) for col in df.columns]
-    df = df.iloc[header_rows:].reset_index(drop=True)
+Output a JSON object like:
+{{
+    "description_column": "ColumnName",
+    "qty_column": "ColumnName",
+    "unit_column": "ColumnName"
+}}
 
-    desc_col, qty_col, unit_col = None, None, None
-
-    for col in df.columns:
-        col_lc = str(col).lower()
-        if any(x in col_lc for x in ["description", "work", "item", "наименование"]):
-            desc_col = col
-        elif any(x in col_lc for x in ["qty", "quantity", "amount", "რაოდენობა", "кол-во"]):
-            qty_col = col
-        elif any(x in col_lc for x in ["unit", "measure", "ed.", "ერთეული", "мера"]):
-            unit_col = col
-
-    if not qty_col:
-        for col in df.columns:
-            if pd.to_numeric(df[col], errors='coerce').notnull().sum() > 0:
-                qty_col = col
-                break
-
-    if not unit_col:
-        for col in df.columns:
-            if df[col].astype(str).str.lower().str.contains(r"\\b(m2|m3|pcs|set|piece|თვე|ცალი)\\b", regex=True).sum() > 0:
-                unit_col = col
-                break
-
-    return {
-        "df": df,
-        "description_column": desc_col,
-        "qty_column": qty_col,
-        "unit_column": unit_col
-    }
+Table:
+{content_preview}
+"""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        content = response.choices[0].message['content']
+        parsed = json.loads(content)
+        return {
+            "df": df,
+            "description_column": parsed.get("description_column"),
+            "qty_column": parsed.get("qty_column"),
+            "unit_column": parsed.get("unit_column")
+        }
+    except Exception as e:
+        print("GPT structuring failed:", e)
+        return {"df": df, "description_column": None, "qty_column": None, "unit_column": None}
 
 def translate_text(text: str, target_language='en') -> str:
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": f"Translate to {target_language}. Only translated result, nothing else."},
                 {"role": "user", "content": text}
