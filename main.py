@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import tempfile
 import re
-from gpt import translate_text, detect_boq_structure, extract_supplier_name_from_pdf
+from gpt import detect_boq_structure, translate_text
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -77,18 +77,18 @@ def handle_docs(message):
                 continue
 
             structure = detect_boq_structure(df)
-            desc_col = structure['description_column']
-            qty_col = structure['qty_column']
-            unit_col = structure['unit_column']
+            df = structure["df"]
+            desc_col = structure["description_column"]
+            qty_col = structure["qty_column"]
+            unit_col = structure["unit_column"]
 
             if not desc_col or not qty_col or not unit_col:
                 continue
 
-            sub_df = structure['df'][[desc_col, qty_col, unit_col]].copy()
+            sub_df = df[[desc_col, qty_col, unit_col]].copy()
             sub_df.columns = ['Description Original', 'Qty', 'Means of Unit']
-
             sub_df['Description Translated'] = sub_df['Description Original'].apply(
-                lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_text(str(x))
+                lambda x: translate_text(str(x)) if isinstance(x, str) and x.strip() else ""
             )
 
             all_data = pd.concat([all_data, sub_df], ignore_index=True)
@@ -108,6 +108,6 @@ def handle_docs(message):
 # === START ===
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Привет! Отправь мне файл BOQ в формате Excel (.xlsx), и я добавлю его в таблицу.")
+    bot.reply_to(message, "👋 Привет, я Вика! Отправь мне файл BOQ в формате Excel (.xlsx), и я добавлю его в таблицу.")
 
 bot.infinity_polling()
