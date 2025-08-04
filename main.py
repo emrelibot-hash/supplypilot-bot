@@ -1,94 +1,97 @@
 import os
+import io
 import json
-import telebot
 import openai
-import fitz  # PyMuPDF
-import tempfile
-import pandas as pd
+import base64
+import telebot
 import gspread
-from flask import Flask, request
-from oauth2client.service_account import ServiceAccountCredentials
+import mimetypes
+import pandas as pd
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
-from httplib2 import Http
+from googleapiclient.http import MediaIoBaseDownload
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+from telebot.types import Message, Document
 
-# --- Config ---
+load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDS_JSON = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
-TEMPLATE_FILE_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"  # шаблон для копирования
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+TEMPLATE_FILE_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
 REGISTRY_SHEET_NAME = "Registry"
 
-# --- Clients ---
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 openai.api_key = OPENAI_API_KEY
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# --- Google auth ---
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS_JSON, scope)
+# Авторизация в Google API
+creds_dict = json.loads(GOOGLE_CREDS_JSON)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(
+    creds_dict,
+    scopes=[
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ],
+)
 client = gspread.authorize(creds)
-drive_service = creds.authorize(Http())
+drive_service = build("drive", "v3", credentials=creds)
 
-# --- Flask (for webhook if needed) ---
-app = Flask(__name__)
-
-# --- Helpers ---
 def ensure_registry():
     try:
         return client.open_by_key(GOOGLE_SHEET_ID).worksheet(REGISTRY_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        return client.open_by_key(GOOGLE_SHEET_ID).add_worksheet(title=REGISTRY_SHEET_NAME, rows="100", cols="3")
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        return sheet.add_worksheet(title=REGISTRY_SHEET_NAME, rows="100", cols="3")
 
 def get_next_boq_code():
     registry = ensure_registry()
-    existing_codes = registry.col_values(1)
-    numbers = [int(code.replace("BOQ-", "")) for code in existing_codes if code.startswith("BOQ-")]
-    next_num = max(numbers) + 1 if numbers else 1
-    return f"BOQ-{next_num:03}"
+    existing = registry.col_values(1)[1:]  # skip header
+    numbers = [int(row.replace("BOQ-", "")) for row in existing if row.startswith("BOQ-")]
+    next_number = max(numbers, default=0) + 1
+    return f"BOQ-{next_number:03d}"
 
-def copy_template_sheet(title):
-    try:
-        copied_file = drive_service.files().copy(
-            fileId=TEMPLATE_FILE_ID,
-            body={"name": title}
-        ).execute()
-        return copied_file["id"]
-    except HttpError as error:
-        print(f"An error occurred while copying the template: {error}")
-        return None
-
-def register_project(boq_code, file_id):
-    registry = ensure_registry()
-    registry.append_row([boq_code, f"https://docs.google.com/spreadsheets/d/{file_id}", "RFQ"])
-
-# --- Handlers ---
-@bot.message_handler(content_types=['document'])
-def handle_docs(message):
+def copy_template_sheet(new_title):
+    copied_file = drive_service.files().copy(
+        fileId=TEMPLATE_FILE_ID,
+        body={"name": new_title}
+    ).execute()
+    return copied_file["id"]
+@bot.message_handler(commands=["start"])
+def handle_start(message: Message):
+    bot.send_message(
+        message.chat.id,
+        "👋 Привет! Я Вика.\n\n" +
+        "📥 Отправь мне:\n— Excel файл (BOQ) для перевода и структуры\n— PDF файл с КП для сравнения с BOQ\n\n" +
+        "Все таблицы будут добавлены в Google Sheets автоматически."
+    )
+@bot.message_handler(content_types=["document"])
+def handle_docs(message: Message):
     try:
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
 
-        file_ext = os.path.splitext(message.document.file_name)[1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-            tmp.write(downloaded_file)
-            tmp_path = tmp.name
+        mime_type, _ = mimetypes.guess_type(message.document.file_name)
 
-        if file_ext == '.xlsx':
+        if message.document.file_name.endswith(".xlsx"):
             boq_code = get_next_boq_code()
             new_sheet_id = copy_template_sheet(boq_code)
-            register_project(boq_code, new_sheet_id)
-            bot.reply_to(message, f"✅ Создан проект {boq_code}. Таблица: https://docs.google.com/spreadsheets/d/{new_sheet_id}")
-        elif file_ext == '.pdf':
-            # Пока заглушка — ожидается реализация привязки к существующему BOQ
-            bot.reply_to(message, "❓ Пожалуйста, укажи, к какому проекту (BOQ) привязать этот файл. Скоро появится меню выбора.")
+
+            registry = ensure_registry()
+            registry.append_row([boq_code, new_sheet_id, message.document.file_name])
+
+            bot.reply_to(message, f"✅ BOQ-файл получен и добавлен как проект *{boq_code}*.", parse_mode="Markdown")
+
+        elif message.document.file_name.endswith(".pdf"):
+            bot.reply_to(message, "📌 Ваша PDF получена. Сейчас запрошу, к какому проекту её привязать...")
+            # Здесь должна быть логика выбора проекта
+
         else:
-            bot.reply_to(message, "⚠️ Поддерживаются только .xlsx и .pdf файлы.")
+            bot.reply_to(message, "⚠️ Поддерживаются только файлы Excel (.xlsx) и PDF.")
 
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"Произошла ошибка: {e}")
 
-# --- Run bot ---
 if __name__ == "__main__":
-    bot.polling(none_stop=True)
+    print("Бот запущен")
+    bot.infinity_polling()
