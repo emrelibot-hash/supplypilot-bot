@@ -6,6 +6,7 @@ import gspread
 import base64
 import json
 import pandas as pd
+import re
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
@@ -72,9 +73,8 @@ def handle_docs(message: Message):
     filename = message.document.file_name.lower()
 
     if filename.endswith(".xlsx") or filename.endswith(".xls"):
-        xls = pd.ExcelFile(io.BytesIO(downloaded))
-        for sheet_name in xls.sheet_names:
-            df = xls.parse(sheet_name)
+        xls = pd.read_excel(io.BytesIO(downloaded), sheet_name=None)
+        for sheet_name, df in xls.items():
             project_name = os.path.splitext(message.document.file_name)[0].strip()
             full_name = f"{project_name} - {sheet_name}"
 
@@ -85,17 +85,17 @@ def handle_docs(message: Message):
                 continue
 
             df.columns = [str(c) for c in df.columns]
-            if 'Description' not in df.columns:
+            columns_lower = [col.lower() for col in df.columns]
+            if not any("description" in col for col in columns_lower):
                 df.rename(columns={df.columns[1]: 'Description'}, inplace=True)
-
-            if 'Qty' not in df.columns:
+            if not any("qty" in col for col in columns_lower):
                 df.rename(columns={df.columns[2]: 'Qty'}, inplace=True)
-
-            if 'Means of Unit' not in df.columns:
+            if not any("unit" in col for col in columns_lower):
                 df.rename(columns={df.columns[3]: 'Means of Unit'}, inplace=True)
 
             df['Description Original'] = df['Description']
-            df['Description Translated'] = df['Description'].apply(lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(str(x)))
+            df['Description Translated'] = df['Description'].apply(
+                lambda x: x if re.search(r'[а-яА-Яa-zA-Z]', str(x)) else translate_and_structure_boq(x))
 
             output_df = df[['Description Original', 'Description Translated', 'Qty', 'Means of Unit']]
             sheet.update([output_df.columns.values.tolist()] + output_df.values.tolist())
