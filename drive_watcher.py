@@ -1,4 +1,4 @@
-import os, io, time
+import os, io
 from typing import List, Tuple
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -31,7 +31,7 @@ def list_boq_files(project_id: str) -> List[dict]:
                                fields="files(id,name,mimeType,modifiedTime)").execute().get("files", [])
 
 def list_kp_files(project_id: str) -> List[Tuple[str, dict]]:
-    """Возвращает [(supplier_name, file_meta)]. Файлы в /кп/<Supplier>/"""
+    """[(supplier_name, file_meta)] из подпапок /кп/<Supplier>/"""
     kp_root = _find_subfolder(project_id, "кп")
     if not kp_root: return []
     svc = _svc()
@@ -45,8 +45,8 @@ def list_kp_files(project_id: str) -> List[Tuple[str, dict]]:
         out += [(s["name"], f) for f in files]
     return out
 
-def download_file_xlsx(file_id: str, out_path: str) -> str:
-    """Скачивает файл бинарно (ожидаем xlsx/csv)."""
+def download_file_xls_any(file_id: str, out_path: str) -> str:
+    """Скачивает файл из Drive как есть (.xls/.xlsx/.csv)"""
     svc = _svc()
     req = svc.files().get_media(fileId=file_id)
     with io.FileIO(out_path, "wb") as fh:
