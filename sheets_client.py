@@ -18,12 +18,11 @@ def ensure_project_sheet(project_name: str):
     try:
         ws = sh.worksheet(project_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=project_name, rows=2000, cols=60)
+        ws = sh.add_worksheet(title=project_name, rows=2000, cols=80)
         ws.update([["No","Description","Unit","Qty","Notes (System)"]])
     return ws
 
 def read_boq_current(ws) -> List[Dict]:
-    """Читаем текущие строки ядра (A:E) как истину для маппинга КП."""
     vals = ws.get_all_values()
     if len(vals) <= 1: return []
     rows = []
@@ -33,8 +32,8 @@ def read_boq_current(ws) -> List[Dict]:
             "No": (r[0] or "").strip(),
             "Description": (r[1] or "").strip(),
             "Unit": (r[2] or "").strip(),
-            "Qty": r[3].strip() if len(r) > 3 and r[3] else "",
-            "System": r[4] if len(r) > 4 else ""
+            "Qty": (r[3] or "").strip(),
+            "System": (r[4] or "").strip() if len(r) > 4 else ""
         })
     return rows
 
@@ -51,12 +50,12 @@ def ensure_supplier_block(ws, supplier: str):
     ws.update_cell(1, start_col+3, block[3])
 
 def write_boq(ws, rows: List[Dict]):
-    """Переписываем A:E блок. Поставщики не трогаем."""
+    """Переписываем A:E блок. Поставщиков не трогаем."""
     data = [[r.get("No",""), r.get("Description",""), r.get("Unit",""), r.get("Qty",""), r.get("system_note","")] for r in rows]
     ws.resize(rows=len(data)+1)
     if data:
         ws.update(f"A2:E{len(data)+1}", data)
-    # Обновим формулы Total у всех supplier-блоков
+    # Формулы Total для всех supplier-блоков
     header = ws.row_values(1)
     for ci, h in enumerate(header, start=1):
         if "— Unit Price" in h:
@@ -68,12 +67,10 @@ def write_boq(ws, rows: List[Dict]):
                 ws.update_cell(r, total_col, f"={unit_cell}*{qty_cell}")
 
 def write_supplier_prices(ws, supplier: str, mapped_rows: List[Dict]):
-    """mapped_rows: [{'row_index', 'unit_price', 'match', 'notes'}]"""
     header = ws.row_values(1)
     ucol = header.index(f"{supplier} — Unit Price")+1
     mcol = header.index(f"{supplier} — Match")+1
     ncol = header.index(f"{supplier} — Notes")+1
-    # batch updates — быстрее
     cells = []
     for r in mapped_rows:
         cells.append(gspread.Cell(r["row_index"], ucol, r.get("unit_price","")))
