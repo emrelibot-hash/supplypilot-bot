@@ -1,113 +1,57 @@
-import telebot
-import os
-import pandas as pd
-import tempfile
-import re
-from gpt import detect_boq_structure, translate_text
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+import os, threading, time
+from flask import Flask, jsonify
 
-# === CONFIG ===
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-print("LOADED TOKEN:", BOT_TOKEN)
-bot = telebot.TeleBot(BOT_TOKEN)
-SPREADSHEET_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
+from drive_watcher import list_projects, list_boq_files, list_kp_files, download_file_xlsx
+from sheets_client import ensure_project_sheet, read_boq_current, ensure_supplier_block, write_boq, write_supplier_prices
+from processor import parse_boq_xlsx, parse_kp_xlsx, map_kp_to_boq
 
-# === GOOGLE API SETUP ===
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SERVICE_ACCOUNT_FILE = "credentials.json"
-creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-service = build('sheets', 'v4', credentials=creds)
-sheet = service.spreadsheets()
+POLL = int(os.getenv("POLL_SECONDS","60"))
 
-# === HELPERS ===
-def add_project_to_registry(project_name):
-    registry_range = "Registry!A:A"
-    existing = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=registry_range).execute().get("values", [])
-    existing_flat = [r[0] for r in existing]
-    if project_name not in existing_flat:
-        sheet.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Registry!A:B",
-            valueInputOption="RAW",
-            body={"values": [[project_name, project_name]]}
-        ).execute()
+app = Flask(__name__)
 
-def create_project_sheet(project_name):
-    sheet_body = {
-        "requests": [{
-            "addSheet": {
-                "properties": {"title": project_name[:100]}
-            }
-        }]
-    }
-    try:
-        service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=sheet_body).execute()
-    except Exception as e:
-        print("Sheet creation error:", e)
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
-def write_boq_to_sheet(project_name, df):
-    values = [df.columns.tolist()] + df.values.tolist()
-    range_ = f"'{project_name}'!A1"
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=range_,
-        valueInputOption="RAW",
-        body={"values": values}
-    ).execute()
+def tick_once():
+    projects = list_projects()
+    for p in projects:
+        project_name, pid = p["name"], p["id"]
+        ws = ensure_project_sheet(project_name)
 
-# === TELEGRAM HANDLERS ===
-@bot.message_handler(content_types=['document'])
-def handle_docs(message):
-    file_info = bot.get_file(message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
+        # 1) BOQ — берём самый свежий файл, если есть
+        boq_files = list_boq_files(pid)
+        if boq_files:
+            fmeta = boq_files[0]
+            tmp = f"/tmp/{fmeta['id']}.xlsx"
+            download_file_xlsx(fmeta["id"], tmp)
+            rows = parse_boq_xlsx(tmp)
+            if rows:
+                write_boq(ws, rows)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
-        f.write(downloaded_file)
-        filepath = f.name
+        # 2) КП — по подпапкам-поставщикам
+        kp_items = list_kp_files(pid)
+        if kp_items:
+            # для точного маппинга читаем текущий BOQ из листа
+            boq_sheet_rows = read_boq_current(ws)
+            for supplier, fmeta in kp_items:
+                tmp = f"/tmp/{fmeta['id']}.xlsx"
+                download_file_xlsx(fmeta["id"], tmp)
+                kp_df = parse_kp_xlsx(tmp)
+                ensure_supplier_block(ws, supplier)
+                mapped = map_kp_to_boq(boq_sheet_rows, kp_df)
+                if mapped:
+                    write_supplier_prices(ws, supplier, mapped)
 
-    project_name = os.path.splitext(message.document.file_name)[0]
-    try:
-        xls = pd.ExcelFile(filepath)
-        all_data = pd.DataFrame()
+def loop():
+    while True:
+        try:
+            tick_once()
+        except Exception as e:
+            print("tick error:", repr(e))
+        time.sleep(POLL)
 
-        for sheet_name in xls.sheet_names:
-            df = xls.parse(sheet_name)
-            if df.empty:
-                continue
-
-            structure = detect_boq_structure(df)
-            df = structure["df"]
-            desc_col = structure["description_column"]
-            qty_col = structure["qty_column"]
-            unit_col = structure["unit_column"]
-
-            if not desc_col or not qty_col or not unit_col:
-                continue
-
-            sub_df = df[[desc_col, qty_col, unit_col]].copy()
-            sub_df.columns = ['Description Original', 'Qty', 'Means of Unit']
-            sub_df['Description Translated'] = sub_df['Description Original'].apply(
-                lambda x: translate_text(str(x)) if isinstance(x, str) and x.strip() else ""
-            )
-
-            all_data = pd.concat([all_data, sub_df], ignore_index=True)
-
-        if all_data.empty:
-            bot.reply_to(message, "❌ Не удалось извлечь данные из таблицы.")
-            return
-
-        add_project_to_registry(project_name)
-        create_project_sheet(project_name)
-        write_boq_to_sheet(project_name, all_data)
-        bot.reply_to(message, f"✅ Проект «{project_name}» добавлен.")
-    except Exception as e:
-        print("Ошибка обработки:", e)
-        bot.reply_to(message, "⚠️ Ошибка при обработке файла.")
-
-# === START ===
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 Привет, я Вика! Отправь мне файл BOQ в формате Excel (.xlsx), и я добавлю его в таблицу.")
-
-bot.infinity_polling()
+if __name__ == "__main__":
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
