@@ -1,15 +1,14 @@
-import os, io
-from typing import List, Tuple
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2.service_account import Credentials
+from config import GOOGLE_FOLDER_ID, GOOGLE_CREDS_JSON
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-FOLDER_ID = os.environ["GOOGLE_FOLDER_ID"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+FOLDER_ID = GOOGLE_FOLDER_ID
 
 def _svc():
-    creds = Credentials.from_service_account_info(eval(os.environ["GOOGLE_CREDS_JSON"]), scopes=SCOPES)
+    creds = Credentials.from_service_account_info(GOOGLE_CREDS_JSON, scopes=SCOPES)
     return build("drive", "v3", credentials=creds)
+
 
 def list_projects() -> List[dict]:
     """Папки верхнего уровня в корневой папке = проекты."""
