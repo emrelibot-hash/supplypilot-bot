@@ -1,7 +1,7 @@
 import os, threading, time
 from flask import Flask, jsonify
 
-from drive_watcher import list_projects, list_boq_files, list_kp_files, download_file_xlsx
+from drive_watcher import list_projects, list_boq_files, list_kp_files, download_file_xls_any
 from sheets_client import ensure_project_sheet, read_boq_current, ensure_supplier_block, write_boq, write_supplier_prices
 from processor import parse_boq_xlsx, parse_kp_xlsx, map_kp_to_boq
 
@@ -23,8 +23,8 @@ def tick_once():
         boq_files = list_boq_files(pid)
         if boq_files:
             fmeta = boq_files[0]
-            tmp = f"/tmp/{fmeta['id']}.xlsx"
-            download_file_xlsx(fmeta["id"], tmp)
+            tmp = f"/tmp/{fmeta['id']}.xls"
+            download_file_xls_any(fmeta["id"], tmp)
             rows = parse_boq_xlsx(tmp)
             if rows:
                 write_boq(ws, rows)
@@ -32,11 +32,10 @@ def tick_once():
         # 2) КП — по подпапкам-поставщикам
         kp_items = list_kp_files(pid)
         if kp_items:
-            # для точного маппинга читаем текущий BOQ из листа
-            boq_sheet_rows = read_boq_current(ws)
+            boq_sheet_rows = read_boq_current(ws)  # истина для маппинга
             for supplier, fmeta in kp_items:
-                tmp = f"/tmp/{fmeta['id']}.xlsx"
-                download_file_xlsx(fmeta["id"], tmp)
+                tmp = f"/tmp/{fmeta['id']}.xls"
+                download_file_xls_any(fmeta["id"], tmp)
                 kp_df = parse_kp_xlsx(tmp)
                 ensure_supplier_block(ws, supplier)
                 mapped = map_kp_to_boq(boq_sheet_rows, kp_df)
