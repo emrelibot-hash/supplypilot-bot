@@ -1,14 +1,13 @@
-import os, gspread
-from typing import List, Dict
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from gspread.utils import rowcol_to_a1
+from config import GOOGLE_SHEET_ID, GOOGLE_CREDS_JSON
 
-SCOPE = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
 def _gc():
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(eval(os.environ["GOOGLE_CREDS_JSON"]), SCOPE)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS_JSON, SCOPE)
     return gspread.authorize(creds)
+
 
 def get_sheet():
     return _gc().open_by_key(SHEET_ID)
