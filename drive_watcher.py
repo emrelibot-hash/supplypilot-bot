@@ -1,5 +1,5 @@
 import os
-from typing import List  # Фикс ошибки NameError
+from typing import List
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 from config import GOOGLE_FOLDER_ID, GOOGLE_CREDS_JSON
@@ -41,4 +41,10 @@ def list_kp_files(project_id: str) -> List[dict]:
     ).execute()
     return results.get("files", [])
 
-def download
+def download_file_xls_any(file_id: str, local_path: str):
+    """Скачивает XLS/XLSX файл с Google Drive по ID."""
+    service = _svc()
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as f:
+        downloader = request.execute()
+        f.write(downloader)
