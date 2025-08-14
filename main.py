@@ -1,21 +1,24 @@
-# === main.py ===
-import os
 import telebot
-import pandas as pd
+import os
 import tempfile
+import openai
+import pandas as pd
+from gpt import extract_boq_using_gpt, translate_text
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from gpt import extract_boq_using_gpt, translate_text
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+SERVICE_ACCOUNT_FILE = "credentials.json"
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
-SPREADSHEET_ID = "1zKd3hq7R-CI_i0azdZsdIPihBNT-6BlhADW0M0eiGpo"
+# === GOOGLE API ===
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SERVICE_ACCOUNT_FILE = "credentials.json"
 creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-sheet = build('sheets', 'v4', credentials=creds).spreadsheets()
+service = build('sheets', 'v4', credentials=creds)
+sheet = service.spreadsheets()
 
 # === HELPERS ===
 def add_project_to_registry(project_name):
@@ -31,7 +34,7 @@ def add_project_to_registry(project_name):
         ).execute()
 
 def create_project_sheet(project_name):
-    body = {
+    sheet_body = {
         "requests": [{
             "addSheet": {
                 "properties": {"title": project_name[:100]}
@@ -39,59 +42,51 @@ def create_project_sheet(project_name):
         }]
     }
     try:
-        sheet.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+        service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=sheet_body).execute()
     except Exception as e:
         print("Sheet creation error:", e)
 
-
 def write_boq_to_sheet(project_name, df):
     values = [df.columns.tolist()] + df.values.tolist()
-    sheet.values().update(
+    range_ = f"'{project_name}'!A1"
+    service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{project_name}'!A1",
+        range=range_,
         valueInputOption="RAW",
         body={"values": values}
     ).execute()
 
-# === BOT HANDLERS ===
+# === TELEGRAM HANDLERS ===
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Привет! Отправь мне Excel-файл BOQ (.xlsx), и я добавлю его в таблицу.")
+    bot.reply_to(message, "👋 Привет! Отправь мне BOQ-файл Excel (.xlsx), и я добавлю его в таблицу после обработки GPT.")
 
 @bot.message_handler(content_types=['document'])
-def handle_document(message):
-    file_info = bot.get_file(message.document.file_id)
-    downloaded = bot.download_file(file_info.file_path)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
-        f.write(downloaded)
-        temp_path = f.name
-
+def handle_docs(message):
     try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
+            f.write(downloaded_file)
+            filepath = f.name
+
         project_name = os.path.splitext(message.document.file_name)[0]
-        xls = pd.ExcelFile(temp_path)
-        combined_df = pd.DataFrame()
+        df_boq = extract_boq_using_gpt(filepath)
 
-        for sheet_name in xls.sheet_names:
-            df = xls.parse(sheet_name)
-            if df.empty:
-                continue
-
-            extracted = extract_boq_using_gpt(df)
-            if not extracted.empty:
-                combined_df = pd.concat([combined_df, extracted], ignore_index=True)
-
-        if combined_df.empty:
-            bot.reply_to(message, "❌ Не удалось извлечь позиции из таблицы. Возможно, формат не поддерживается.")
+        if df_boq is None or df_boq.empty:
+            bot.reply_to(message, "❌ GPT не смог извлечь данные из файла.")
             return
 
+        # Добавляем в таблицу
         add_project_to_registry(project_name)
         create_project_sheet(project_name)
-        write_boq_to_sheet(project_name, combined_df)
-        bot.reply_to(message, f"✅ Проект '{project_name}' успешно добавлен!")
+        write_boq_to_sheet(project_name, df_boq)
+        bot.reply_to(message, f"✅ Проект «{project_name}» добавлен в Google Sheet.")
 
     except Exception as e:
-        print("Ошибка обработки документа:", e)
-        bot.reply_to(message, "⚠️ Ошибка при обработке файла.")
+        print("Ошибка:", e)
+        bot.reply_to(message, "⚠️ Произошла ошибка при обработке файла.")
 
+# === RUN ===
 bot.infinity_polling()
