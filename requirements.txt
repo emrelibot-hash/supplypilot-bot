@@ -11,3 +11,8 @@ python-dotenv
 xlrd==2.0.1
 openpyxl
 PyPDF2
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+telebot
