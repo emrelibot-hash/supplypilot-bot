@@ -1,61 +1,108 @@
 # gpt.py
-
-import openai
 import os
+import openai
 import pandas as pd
 import pdfplumber
+from openpyxl import load_workbook
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def call_gpt(prompt: str, model="gpt-3.5-turbo", max_tokens=1500):
-    response = openai.ChatCompletion.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant for parsing tables and matching procurement data."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=max_tokens
-    )
-    return response.choices[0].message.content.strip()
 
 def extract_text_from_excel(file_path: str) -> str:
-    try:
-        df_list = pd.read_excel(file_path, sheet_name=None)
-        text_chunks = []
-        for sheet_name, df in df_list.items():
-            df = df.fillna("")
-            text = "\n".join(["\t".join(map(str, row)) for row in df.values])
-            text_chunks.append(f"[{sheet_name}]\n{text}")
-        return "\n\n".join(text_chunks)
-    except Exception as e:
-        return f"[Error reading Excel file: {e}]"
+    wb = load_workbook(filename=file_path, read_only=True, data_only=True)
+    text = ""
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows(values_only=True):
+            line = " | ".join(str(cell) if cell is not None else "" for cell in row)
+            if line.strip():
+                text += line + "\n"
+    return text
+
 
 def extract_text_from_pdf(file_path: str) -> str:
-    try:
-        with pdfplumber.open(file_path) as pdf:
-            pages = [page.extract_text() for page in pdf.pages if page.extract_text()]
-            return "\n\n".join(pages)
-    except Exception as e:
-        return f"[Error reading PDF file: {e}]"
+    text = ""
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
 
-def extract_boq_using_gpt(file_path: str) -> list:
-    print(f"[GPT] Extracting BOQ from {file_path}")
-    if file_path.lower().endswith(".pdf"):
-        raw_text = extract_text_from_pdf(file_path)
+
+def ask_gpt_to_structure(text: str, is_boq=True) -> list[dict]:
+    prompt = (
+        "You are an assistant for structuring procurement data.\n"
+        "Below is raw extracted text from a file. "
+        "Please extract and return a structured JSON array with the following fields:\n"
+    )
+
+    if is_boq:
+        prompt += "[No, Description, Unit, Qty]\n"
     else:
+        prompt += "[No, Unit Price, Notes]\n"
+
+    prompt += (
+        "Ignore headers, currency symbols, and empty rows. "
+        "Try to match formatting used in Excel or PDF. "
+        "Respond ONLY with JSON array. No explanations.\n\n"
+        f"Raw text:\n{text[:12000]}"
+    )
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": "You are a data extraction assistant."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    json_output = response.choices[0].message.content.strip()
+    try:
+        import json
+        return json.loads(json_output)
+    except Exception as e:
+        print(f"[GPT Error] Failed to parse JSON: {e}")
+        return []
+
+
+def extract_boq_using_gpt(file_path: str) -> list[dict]:
+    ext = file_path.lower()
+    if ext.endswith(".pdf"):
+        raw_text = extract_text_from_pdf(file_path)
+    elif ext.endswith(".xls") or ext.endswith(".xlsx"):
         raw_text = extract_text_from_excel(file_path)
+    else:
+        raise ValueError("Unsupported BOQ file format")
+    return ask_gpt_to_structure(raw_text, is_boq=True)
 
-    prompt = f"""
-You are given the raw contents of a BOQ (Bill of Quantities). Extract a clean structured list in the format:
-No | Description | Unit | Qty
 
-If section headers are used, include them as rows with only the Description field filled (other fields empty).
+def extract_offer_using_gpt(file_path: str, supplier_name: str) -> dict:
+    ext = file_path.lower()
+    if ext.endswith(".pdf"):
+        raw_text = extract_text_from_pdf(file_path)
+    elif ext.endswith(".xls") or ext.endswith(".xlsx"):
+        raw_text = extract_text_from_excel(file_path)
+    else:
+        raise ValueError("Unsupported offer file format")
+    rows = ask_gpt_to_structure(raw_text, is_boq=False)
+    return {
+        "supplier": supplier_name,
+        "rows": rows
+    }
 
-Respond with the result as JSON array of objects with keys:
-- number (or null if not applicable),
-- description,
-- unit,
-- qty
 
-Here is the BOQ content:
+def translate_text(text: str, target_language="en") -> str:
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": f"Translate to {target_language}."},
+                {"role": "user", "content": text}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[GPT Error] Translation failed: {e}")
+        return text
