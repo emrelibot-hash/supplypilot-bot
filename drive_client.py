@@ -1,94 +1,96 @@
-# drive_client.py
-import os
-import mimetypes
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from google.oauth2 import service_account
 import io
+import os
+import mimetypes
+import pandas as pd
+from utils import extract_excel_from_bytes
 
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+# Константы
+SCOPES = ['https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = 'credentials.json'
+ROOT_FOLDER_ID = '1J85RsAoGbCAbE8kEtgYRIPLbRcfph1zP'  # ← заменить при необходимости
 
-creds = service_account.Credentials.from_service_account_info(
-    eval(GOOGLE_CREDS_JSON), scopes=SCOPES
-)
-drive_service = build("drive", "v3", credentials=creds)
+# Инициализация клиента
+creds = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=creds)
 
-class ProjectFolder:
-    def __init__(self, id, name):
-        self.id = id
-        self.name = name
-        self.boq_path = None
-        self.boq_written = False
-        self.offer_files = []  # List of OfferFile instances
-
-    def mark_boq_as_written(self):
-        self.boq_written = True
-
-    def unprocessed_offers(self):
-        return [offer for offer in self.offer_files if not offer.processed]
-
-class OfferFile:
-    def __init__(self, file_path, supplier_name):
-        self.file_path = file_path
-        self.supplier_name = supplier_name
-        self.processed = False
-
-    def mark_as_processed(self):
-        self.processed = True
-
-def list_folders(parent_id):
+def list_folders_in_folder(parent_id):
+    """Возвращает список папок внутри указанной папки"""
     results = drive_service.files().list(
         q=f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-        fields="files(id, name)",
-    ).execute()
-    return results.get("files", [])
+        pageSize=1000,
+        fields="files(id, name)").execute()
+    return results.get('files', [])
 
-def list_files(parent_id):
+def list_files_in_folder(folder_id):
+    """Возвращает список файлов (не папок) внутри указанной папки"""
     results = drive_service.files().list(
-        q=f"'{parent_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType)",
-    ).execute()
-    return results.get("files", [])
+        q=f"'{folder_id}' in parents and trashed = false",
+        pageSize=1000,
+        fields="files(id, name, mimeType)").execute()
+    return results.get('files', [])
 
-def download_file(file_id, filename):
+def download_file(file_id):
+    """Скачивает файл и возвращает байты"""
     request = drive_service.files().get_media(fileId=file_id)
-    fh = io.FileIO(filename, "wb")
+    fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
-    while not done:
+    while done is False:
         status, done = downloader.next_chunk()
-    return filename
+    fh.seek(0)
+    return fh.read()
 
-def get_projects_from_drive(root_folder_id):
+def find_boq_file(project_folder_id):
+    """Ищет BOQ-файл в подпапке /boq/"""
+    subfolders = list_folders_in_folder(project_folder_id)
+    boq_folder = next((f for f in subfolders if f['name'].lower() == 'boq'), None)
+    if not boq_folder:
+        return None, None
+    boq_files = list_files_in_folder(boq_folder['id'])
+    if not boq_files:
+        return None, None
+    boq_file = boq_files[0]
+    boq_bytes = download_file(boq_file['id'])
+    return boq_file['name'], boq_bytes
+
+def find_offer_files(project_folder_id):
+    """Ищет все предложения в подпапке /кп/<Поставщик>/"""
+    supplier_folders = list_folders_in_folder(project_folder_id)
+    offers = []
+
+    for folder in supplier_folders:
+        if folder['name'].lower() != 'кп':
+            continue
+        supplier_subfolders = list_folders_in_folder(folder['id'])
+        for supplier_folder in supplier_subfolders:
+            supplier_name = supplier_folder['name']
+            supplier_files = list_files_in_folder(supplier_folder['id'])
+            for file in supplier_files:
+                file_bytes = download_file(file['id'])
+                offers.append({
+                    'supplier': supplier_name,
+                    'filename': file['name'],
+                    'bytes': file_bytes
+                })
+    return offers
+
+def get_projects_from_drive():
+    """Сканирует все проекты в корневой папке и собирает BOQ + КП"""
     projects = []
-
-    for project_meta in list_folders(root_folder_id):
-        project = ProjectFolder(project_meta["id"], project_meta["name"])
-        subfolders = list_folders(project.id)
-
-        for sub in subfolders:
-            sub_name = sub["name"].lower()
-
-            if "boq" in sub_name:
-                files = list_files(sub["id"])
-                for file in files:
-                    if file["name"].endswith((".xls", ".xlsx")):
-                        local_path = f"/tmp/{file['name']}"
-                        download_file(file["id"], local_path)
-                        project.boq_path = local_path
-
-            elif "кп" in sub_name or "kp" in sub_name:
-                supplier_folders = list_folders(sub["id"])
-                for supplier in supplier_folders:
-                    supplier_name = supplier["name"]
-                    offer_files = list_files(supplier["id"])
-                    for file in offer_files:
-                        if file["name"].endswith((".xls", ".xlsx", ".pdf")):
-                            local_path = f"/tmp/{file['name']}"
-                            download_file(file["id"], local_path)
-                            project.offer_files.append(OfferFile(local_path, supplier_name))
-
-        projects.append(project)
-
+    folders = list_folders_in_folder(ROOT_FOLDER_ID)
+    for folder in folders:
+        boq_name, boq_bytes = find_boq_file(folder['id'])
+        if not boq_bytes:
+            continue
+        offers = find_offer_files(folder['id'])
+        projects.append({
+            'project_name': folder['name'],
+            'boq_file': boq_name,
+            'boq_bytes': boq_bytes,
+            'offers': offers
+        })
     return projects
