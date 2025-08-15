@@ -2,6 +2,11 @@
 import os
 import time
 from drive_client import get_projects_from_drive
+if __name__ == "__main__":
+    projects = get_projects_from_drive()
+    print(f"🟢 Найдено проектов: {len(projects)}")
+    for p in projects:
+        print(f"📁 {p['project_name']} | BOQ: {p['boq_file']} | КП: {len(p['offers'])}")
 from sheets_client import write_boq_to_sheet, write_offer_to_sheet
 from gpt import extract_boq_using_gpt, extract_offer_using_gpt
 
