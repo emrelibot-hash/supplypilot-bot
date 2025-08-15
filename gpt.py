@@ -1,107 +1,61 @@
+# gpt.py
+
 import openai
 import os
 import pandas as pd
-import PyPDF2
+import pdfplumber
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def extract_boq_using_gpt(file_path: str):
-    df = pd.read_excel(file_path, dtype=str).fillna("")
-    text = df.to_string(index=False, header=False)
-
-    prompt = f"""
-You are a tender analyst. From the following table text, extract structured BOQ data.
-
-Return ONLY a JSON array of objects with:
-- no (line/item number)
-- description (work description)
-- unit (unit of measure)
-- qty (quantity)
-
-Example:
-[
-  {{"no": "1", "description": "Installation of ventilation", "unit": "m2", "qty": "120"}},
-  ...
-]
-
-TABLE:
-{text}
-    """
-
+def call_gpt(prompt: str, model="gpt-3.5-turbo", max_tokens=1500):
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model=model,
         messages=[
-            {"role": "system", "content": "You are an expert in construction tenders."},
+            {"role": "system", "content": "You are a helpful assistant for parsing tables and matching procurement data."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0,
+        temperature=0.2,
+        max_tokens=max_tokens
     )
+    return response.choices[0].message.content.strip()
 
-    result = response.choices[0].message.content
+def extract_text_from_excel(file_path: str) -> str:
     try:
-        items = eval(result)
-        rows = [[i["no"], i["description"], i["unit"], i["qty"], ""] for i in items]
-        return rows
+        df_list = pd.read_excel(file_path, sheet_name=None)
+        text_chunks = []
+        for sheet_name, df in df_list.items():
+            df = df.fillna("")
+            text = "\n".join(["\t".join(map(str, row)) for row in df.values])
+            text_chunks.append(f"[{sheet_name}]\n{text}")
+        return "\n\n".join(text_chunks)
     except Exception as e:
-        print("[GPT Parse Error] BOQ:", e)
-        return []
+        return f"[Error reading Excel file: {e}]"
 
 def extract_text_from_pdf(file_path: str) -> str:
     try:
-        with open(file_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            pages_text = [page.extract_text() for page in reader.pages]
-            return "\n".join(pages_text)
+        with pdfplumber.open(file_path) as pdf:
+            pages = [page.extract_text() for page in pdf.pages if page.extract_text()]
+            return "\n\n".join(pages)
     except Exception as e:
-        print(f"[PDF Read Error] {e}")
-        return ""
+        return f"[Error reading PDF file: {e}]"
 
-def extract_offer_using_gpt(file_path: str, supplier: str):
-    text = ""
-
+def extract_boq_using_gpt(file_path: str) -> list:
+    print(f"[GPT] Extracting BOQ from {file_path}")
     if file_path.lower().endswith(".pdf"):
-        text = extract_text_from_pdf(file_path)
-    elif file_path.lower().endswith((".xls", ".xlsx")):
-        df = pd.read_excel(file_path, dtype=str).fillna("")
-        text = df.to_string(index=False, header=False)
+        raw_text = extract_text_from_pdf(file_path)
     else:
-        print(f"[Unsupported File] {file_path}")
-        return []
+        raw_text = extract_text_from_excel(file_path)
 
     prompt = f"""
-You are analyzing a supplier offer. Extract item prices and match them to BOQ.
+You are given the raw contents of a BOQ (Bill of Quantities). Extract a clean structured list in the format:
+No | Description | Unit | Qty
 
-Return ONLY a JSON list of:
-[
-  {{
-    "no": "1",
-    "unit_price": "12.50",
-    "total": "1250",
-    "match": "✅" or "❗",
-    "notes": "text if needed"
-  }},
-  ...
-]
-Assume BOQ quantity is known. Always return unit_price and compute total = unit_price * qty.
+If section headers are used, include them as rows with only the Description field filled (other fields empty).
 
-TABLE:
-{text}
-    """
+Respond with the result as JSON array of objects with keys:
+- number (or null if not applicable),
+- description,
+- unit,
+- qty
 
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a procurement analyst."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0,
-    )
-
-    result = response.choices[0].message.content
-    try:
-        items = eval(result)
-        rows = [[i["unit_price"], i["total"], i["match"], i["notes"]] for i in items]
-        return [{"supplier": supplier, "rows": rows}]
-    except Exception as e:
-        print("[GPT Parse Error] Offer:", e)
-        return []
+Here is the BOQ content:
