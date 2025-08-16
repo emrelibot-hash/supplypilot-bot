@@ -1,9 +1,9 @@
 from __future__ import annotations
 import pandas as pd
-import io
-import re
-from typing import Dict, List, Tuple
+import io, re
+from typing import Dict, List, Tuple, Optional
 
+# ======== helpers ========
 def _read_excel_from_bytes(b: bytes) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(b), engine="openpyxl")
 
@@ -14,133 +14,112 @@ def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
-    """Ищем колонki Description/Unit/Qty (толерантно к регистру/языку)."""
-    df = _read_excel_from_bytes(boq_bytes)
-    cols = {c.lower(): c for c in df.columns}
+# Синонимы (EN/RU/GE)
+_DESC_KEYS = {"description","desc","наименование","наим","описание","наим.","დასახელება","აღწერა"}
+_UNIT_KEYS = {"unit","ед","ед.","единица","ед.изм","ед. изм.","measure","ერთეული","საზომი ერთეული"}
+_QTY_KEYS  = {"qty","quantity","кол-во","количество","кол во","რაოდენობა"}
+_NO_KEYS   = {"no","№","#","item","position","позиция","поз.","номер","ნომერი","პოზიცია"}
 
-    # гибкие сопоставления
-    def pick(*aliases):
+_AMOUNT_LIKE = {"amount","sum","total","subtotal","итого","сумма","სულ"}
+
+def _pick_by_name(cols_lower: Dict[str,str], aliases: set[str]) -> Optional[str]:
+    for a in aliases:
+        if a in cols_lower: 
+            return cols_lower[a]
+    # мягкий поиск подстроки
+    for key, orig in cols_lower.items():
         for a in aliases:
-            if a in cols: 
-                return cols[a]
-        return None
+            if re.search(rf"\b{re.escape(a)}\b", key):
+                return orig
+    return None
 
-    c_desc = pick("description", "наименование", "наим.", "описание")
-    c_unit = pick("unit", "ед", "ед.", "единица", "ед.изм", "ед. изм.", "measure")
-    c_qty  = pick("qty", "quantity", "кол-во", "количество", "кол во")
+def _looks_like_seq_1n(series: pd.Series) -> bool:
+    """Серия очень похожа на 1..N: целые, возрастают, мало пропусков."""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.isna().mean() > 0.2: 
+        return False
+    ints = (s.dropna() % 1 == 0).mean()   # доля целых
+    if ints < 0.95: 
+        return False
+    # нормализуем с 1
+    s2 = s.dropna().astype(int).reset_index(drop=True)
+    if len(s2) < 3: 
+        return False
+    # проверим последовательность (или почти)
+    diffs = (s2 - pd.Series(range(1, len(s2)+1))).abs()
+    return (diffs <= 1).mean() > 0.95
 
-    if not c_desc or not c_unit or not c_qty:
+def _first_numeric_col(df: pd.DataFrame, exclude: set[str]) -> Optional[str]:
+    candidates = []
+    for c in df.columns:
+        if c in exclude: 
+            continue
+        ratio = pd.to_numeric(df[c], errors="coerce").notna().mean()
+        if ratio > 0.6:
+            candidates.append((ratio, c))
+    candidates.sort(reverse=True)
+    return candidates[0][1] if candidates else None
+
+# ======== BOQ ========
+def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
+    """Извлекаем Description / Unit / Qty, корректно отличая колонку номера позиции."""
+    df_raw = _read_excel_from_bytes(boq_bytes)
+    df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all")
+
+    # Если первая строка — шапка, поднимем её
+    first_row = df_raw.iloc[0].astype(str).map(_norm)
+    if (first_row != "").mean() >= 0.5 and len(set(first_row)) == len(first_row):
+        try:
+            df_raw.columns = [str(x).strip() for x in df_raw.iloc[0]]
+            df_raw = df_raw.iloc[1:]
+        except Exception:
+            pass
+
+    # маппинг колонок по имени
+    cols_lower = {str(c).strip().lower(): c for c in df_raw.columns}
+    c_no   = _pick_by_name(cols_lower, _NO_KEYS)
+    c_desc = _pick_by_name(cols_lower, _DESC_KEYS)
+    c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
+    c_qty  = _pick_by_name(cols_lower, _QTY_KEYS)
+
+    # Если явного номера нет — найдём по содержимому
+    if not c_no:
+        for c in df_raw.columns:
+            if _looks_like_seq_1n(df_raw[c]):
+                c_no = c
+                break
+
+    # Если Qty не найден по имени — ищем лучшую числовую колонку, исключая номер и 'total/amount'
+    exclude = set()
+    if c_no: 
+        exclude.add(c_no)
+    for key in _AMOUNT_LIKE:
+        if key in cols_lower:
+            exclude.add(cols_lower[key])
+    # исключим также явные суммы по подстроке
+    for k, orig in cols_lower.items():
+        if any(w in k for w in _AMOUNT_LIKE):
+            exclude.add(orig)
+
+    if not c_qty:
+        c_qty = _first_numeric_col(df_raw, exclude)
+
+    # Если всё ещё нет — последняя попытка: вторая по числовой доле (вдруг первая была total)
+    if not c_qty:
+        num_cols = [(pd.to_numeric(df_raw[c], errors="coerce").notna().mean(), c) for c in df_raw.columns if c not in exclude]
+        num_cols.sort(reverse=True)
+        if len(num_cols) >= 1:
+            c_qty = num_cols[0][1]
+
+    if not c_desc or not c_qty:
+        print(f"[ERROR] BOQ columns not detected. Available: {list(df_raw.columns)}")
         raise ValueError("BOQ: не найдены обязательные колонки (Description/Unit/Qty)")
 
-    out = pd.DataFrame({
-        "No": range(1, len(df)+1),
-        "Description": df[c_desc].astype(str).fillna(""),
-        "Unit": df[c_unit].astype(str).fillna(""),
-        "Qty": pd.to_numeric(df[c_qty], errors="coerce").fillna(0),
-    })
-    out["desc_key"] = out["Description"].map(_norm)
-    out["unit_key"] = out["Unit"].map(_norm)
-    return out
+    # Unit может отсутствовать — не критично
+    if not c_unit:
+        c_unit = ""
 
-def parse_rfq(rfq_bytes: bytes) -> pd.DataFrame:
-    """Пытаемся вытащить Description / Unit / Unit Price."""
-    df = _read_excel_from_bytes(rfq_bytes)
-    cols = {c.lower(): c for c in df.columns}
-
-    def pick(*aliases):
-        for a in aliases:
-            if a in cols: 
-                return cols[a]
-        return None
-
-    c_desc = pick("description", "наименование", "описание")
-    c_unit = pick("unit", "ед", "ед.", "единица", "ед.изм", "ед. изм.", "measure")
-    c_price = pick("unit price", "price", "цена", "unitprice", "ед.цена", "единичная цена")
-
-    if not c_desc or not c_price:
-        # fallback: попробуем 2 первые текстовые и одну числовую колонку
-        text_cols = [c for c in df.columns if df[c].dtype == "O"]
-        num_cols  = [c for c in df.columns if c not in text_cols]
-        if len(text_cols) >= 1 and len(num_cols) >= 1:
-            c_desc = c_desc or text_cols[0]
-            c_price = c_price or num_cols[0]
-            c_unit = c_unit or (text_cols[1] if len(text_cols) > 1 else None)
-        else:
-            raise ValueError("RFQ: не удалось определить колонки")
-
-    out = pd.DataFrame({
-        "Description": df[c_desc].astype(str).fillna(""),
-        "Unit": df[c_unit].astype(str).fillna("") if c_unit else "",
-        "Unit Price": pd.to_numeric(df[c_price], errors="coerce").fillna(0),
-    })
-    out["desc_key"] = out["Description"].map(_norm)
-    out["unit_key"] = out["Unit"].map(_norm)
-    return out
-
-def align_offers(boq: pd.DataFrame, supplier_to_df: Dict[str, pd.DataFrame]) -> Tuple[List[str], pd.DataFrame]:
-    """
-    Возвращает (список_поставщиков, таблицу для записи в Sheet).
-    Формат: No | Description | Unit | Qty | Notes (System) | <Sup1> Unit Price | Total | Match | Notes | <Sup2> ...
-    """
-    suppliers = sorted(supplier_to_df.keys())
-    base = boq.copy()
-    base["Notes (System)"] = ""
-
-    # создаём колонки под каждого поставщика
-    for s in suppliers:
-        base[(s, "Unit Price")] = 0.0
-        base[(s, "Total")] = 0.0
-        base[(s, "Match")] = ""
-        base[(s, "Notes")] = ""
-
-    # для быстрого джойна по desc_key
-    for s, df in supplier_to_df.items():
-        map_price = df.set_index("desc_key")["Unit Price"].to_dict()
-        map_unit  = df.set_index("desc_key")["unit_key"].to_dict()
-
-        prices = []
-        totals = []
-        match  = []
-        notes  = []
-
-        for _, row in base.iterrows():
-            dk = row["desc_key"]
-            unit_boq = row["unit_key"]
-            qty = row["Qty"]
-            price = map_price.get(dk, 0.0)
-            unit_rfq = map_unit.get(dk, "")
-
-            prices.append(price)
-            totals.append(float(price) * float(qty))
-
-            if dk in map_price:
-                if unit_boq and unit_rfq and unit_boq != unit_rfq:
-                    match.append("❗")
-                    notes.append("Unit mismatch")
-                else:
-                    match.append("✅")
-                    notes.append("")
-            else:
-                match.append("—")
-                notes.append("No line in RFQ")
-
-        base[(s, "Unit Price")] = prices
-        base[(s, "Total")] = totals
-        base[(s, "Match")] = match
-        base[(s, "Notes")] = notes
-
-    # финальная уплощённая таблица
-    cols = ["No", "Description", "Unit", "Qty", "Notes (System)"]
-    for s in suppliers:
-        cols += [ (s, "Unit Price"), (s, "Total"), (s, "Match"), (s, "Notes") ]
-
-    flat = pd.DataFrame()
-    for c in cols:
-        if isinstance(c, tuple):
-            flat[f"{c[0]}: {c[1]}"] = base[c]
-        else:
-            flat[c] = base[c]
-
-    return suppliers, flat
-
+    # Столбец No: используем найденный, иначе 1..N
+    if c_no and c_no in df_raw.columns:
+        try:
+            no_series = pd.to_numeric(df_raw[c_no], errors="coerce").fillna(method="ffill")
