@@ -1,283 +1,307 @@
+# processor.py
+# -*- coding: utf-8 -*-
+"""
+Парсинг BOQ и RFQ (Excel/PDF), нормализация и сведение цен по поставщикам.
+
+Результат для выгрузки в Google Sheets:
+    No | Description | Unit | Qty | <Supplier A: Unit Price> | <Supplier A: Total> | <Supplier A: Match> | <Supplier A: Notes> | <Supplier B: ...> | ...
+
+Требуемые зависимости: pandas, openpyxl, pdfplumber (для PDF), numpy.
+"""
+
 from __future__ import annotations
 
 import io
 import re
-import unicodedata
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
+# -----------------------
+# Наборы ключей и маппинг
+# -----------------------
 
-# ============================ IO & headers ============================
+_DESC_KEYS = [
+    "description", "desc", "наименование", "описание", "დასახელ", "აღწერ"
+]
+_UNIT_KEYS = [
+    "unit", "ед", "ед.", "uom", "единица", "ერთეული", "ერთ.", "measure"
+]
+_QTY_KEYS = [
+    "qty", "quantity", "кол-во", "количество", "რაოდ", "რაოდენობა"
+]
+_PRICE_KEYS = [
+    "unit price", "price", "unit cost", "цена", "стоим", "ერთ. ფასი", "ფასი ერთ"
+]
+_AMOUNT_LIKE = [
+    "amount", "total", "sum", "сумм", "итого", "სულ", "amount(usd)", "total amount"
+]
 
-def _read_all_sheets_from_bytes(b: bytes) -> Dict[str, pd.DataFrame]:
-    return pd.read_excel(io.BytesIO(b), sheet_name=None, engine="openpyxl")
+_UNIT_CANON_MAP = {
+    # штука
+    "pcs": {"pc", "pcs", "шт", "шт.", "ც", "ც.", "piece", "pieces"},
+    # комплект
+    "set": {"set", "компл", "компл.", "კომპლ", "კომპლ.", "kit"},
+    # метр
+    "m": {"m", "м", "მ", "meter", "метр"},
+    # квадратный метр
+    "sqm": {"m2", "м2", "მ2", "sqm", "sq m", "sq. m", "sq.m"},
+    # кубометр
+    "m3": {"m3", "м3", "მ3", "cubic m", "cu m", "cu.m"},
+    # килограмм
+    "kg": {"kg", "кг"},
+    # литр/сек (пример для вентиляции)
+    "l/s": {"l/s", "lps", "lps.", "ლ/წმ"},
+}
+
+# -----------------------
+# Утилиты
+# -----------------------
+
+_ws = re.compile(r"\s+")
+_punct = re.compile(r"[^\w\-./ ]+", flags=re.U)
+_commas = re.compile(r"(?!^),(?=.*\d)")  # запятые как разделители тысяч
+_spaces_in_num = re.compile(r"(?<=\d) (?=\d)")  # 12 345 -> 12345
 
 
-def _raise_header_if_first_row_looks_like_headers(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    try:
-        first = df.iloc[0].astype(str).str.strip().str.lower()
-        if (first != "").mean() >= 0.5 and len(set(first)) == len(first):
-            out = df.iloc[1:].copy()
-            out.columns = list(df.iloc[0])
-            return out
-    except Exception:
-        pass
-    return df
-
-
-# ============================ text/number utils ============================
-
-def _clean_series(s: pd.Series) -> pd.Series:
-    s = s.astype(object).where(~pd.isna(s), "")
-    s = s.replace({"nan": "", "None": "", None: ""})
-    return s.astype(str)
-
-
-def _norm(s: str) -> str:
-    if s is None:
-        s = ""
-    s = unicodedata.normalize("NFKD", str(s)).lower()
-    s = re.sub(r"\([^)]*\)", " ", s)
-    s = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in s)
-    s = re.sub(r"\s+", " ", s).strip()
+def _strip(val) -> str:
+    if pd.isna(val):
+        return ""
+    s = str(val)
+    s = s.replace("\u00A0", " ")
+    s = _ws.sub(" ", s).strip()
     return s
 
 
+def _norm(txt: str) -> str:
+    """Нормализованный ключ описания для сравнения."""
+    s = _strip(txt).lower()
+    s = s.replace(",", " ").replace(";", " ").replace("—", "-")
+    s = _ws.sub(" ", s)
+    return s
+
+
+def _norm_unit(u: str) -> str:
+    u0 = _norm(u)
+    for canon, variants in _UNIT_CANON_MAP.items():
+        if u0 in variants:
+            return canon
+    # частные случаи: одиночные буквы часто с точкой/без
+    if u0 in {"шт", "шт."}:
+        return "pcs"
+    if u0 in {"м2", "м^2", "м²", "m^2"}:
+        return "sqm"
+    if u0 in {"м3", "м^3", "м³", "m^3"}:
+        return "m3"
+    if u0 in {"м", "m"}:
+        return "m"
+    return u0 or ""
+
+
+def _sheet_key(s: str) -> str:
+    return _norm(s)[:40]
+
+
 def _to_float(x) -> float:
-    if isinstance(x, (int, float)) and pd.notna(x):
-        return float(x)
-    s = str(x)
-    if s is None or s.strip() == "":
+    """Конверсия чисел с поддержкой '12 345,67' и '12,345.67'."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return 0.0
-    # убрать валюты/пробелы/нечисловые
-    s = s.replace("\u00A0", "").replace(" ", "")
-    s = re.sub(r"[^\d,.\-]", "", s)
-    if s.count(",") and s.count("."):
-        # последний из разделителей считаем десятичным
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    else:
-        if s.count(",") and not s.count("."):
-            s = s.replace(",", ".")
-        # иначе точки остаются как десятичные, запятые как тысячные уже удалены
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    s = _spaces_in_num.sub("", s)
+    s = _commas.sub("", s)
+    # если запятая как разделитель десятой доли
+    if s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    # убираем валютные символы
+    s = re.sub(r"[$₾€₽£]", "", s)
     try:
         return float(s)
     except Exception:
-        return 0.0
+        # возможно, 1 234.56 с неразрывными пробелами
+        try:
+            s2 = s.replace(" ", "")
+            return float(s2)
+        except Exception:
+            return 0.0
 
 
-# ============================ columns & aliases ============================
-
-_DESC_KEYS = {
-    "description", "desc", "наименование", "наим", "описание", "наим.",
-    "დასახელება", "დაასხელება",
-}
-
-_UNIT_KEYS = {
-    "unit", "ед", "ед.", "единица", "ед.изм", "ед. изм.", "measure",
-    "ერთეული", "საზომი ერთეული", "განზ.", "საზ. ერთ."
-}
-
-_QTY_KEYS = {"qty", "quantity", "кол-во", "количество", "кол во", "რაოდენობა"}
-
-_PRICE_KEYS = {"unit price", "price", "rate", "ед.цена", "единичная цена", "цена", "ერთ. ფასი"}
-
-_AMOUNT_LIKE = {
-    "amount", "sum", "total", "subtotal", "итого", "сумма",
-    "სრული ფასი", "სულ", "სულ მონტაჟი"
-}
-
-_SHEET_STOP = {
-    "summary", "cover", "contents", "readme", "info", "лист1", "sheet1",
-    "итого", "итог", "свод", "сводная", "boq", "rfq",
-    "სულ", "ჯამი", "მთავარი", "main"
-}
-
-
-def _pick_by_name(cols_lower: Dict[str, str], aliases: set[str]) -> Optional[str]:
-    for a in aliases:
-        if a in cols_lower:
-            return cols_lower[a]
-    for k, orig in cols_lower.items():
-        for a in aliases:
-            if a in k:
+def _pick_by_name(cols_lower: Dict[str, str], keys: Iterable[str]) -> Optional[str]:
+    for key in keys:
+        for low, orig in cols_lower.items():
+            if key in low:
                 return orig
     return None
 
 
-def _first_numeric_col(df: pd.DataFrame, exclude: set[str]) -> Optional[str]:
+def _first_numeric_col(df: pd.DataFrame, exclude: Iterable[str] = ()) -> Optional[str]:
+    exc = {e for e in exclude if e in df.columns}
     best = None
-    best_ratio = 0.0
+    best_share = 0.0
     for c in df.columns:
-        if c in exclude:
+        if c in exc:
             continue
-        ratio = pd.to_numeric(df[c], errors="coerce").notna().mean()
-        if ratio > best_ratio:
-            best_ratio, best = ratio, c
+        ser = df[c].apply(_to_float)
+        share = (ser > 0).mean()
+        if share > best_share and share >= 0.3:
+            best_share, best = share, c
     return best
 
 
-def _valid_data_sheet(df: pd.DataFrame) -> bool:
-    if df is None or df.shape[1] <= 1 or df.dropna(how="all").empty:
-        return False
-    num_ratio = 0.0
-    for c in df.columns:
-        r = pd.to_numeric(df[c], errors="coerce").notna().mean()
-        num_ratio = max(num_ratio, r)
-    text_like = any(df[c].dtype == "O" for c in df.columns)
-    return (num_ratio > 0.2) and text_like
+def _raise_header_if_first_row_looks_like_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Если первая строка похожа на шапку — поднимем её в заголовки."""
+    row0 = df.iloc[0].astype(str).str.lower().str.strip()
+    hits = 0
+    for v in row0:
+        if any(k in v for k in _DESC_KEYS + _UNIT_KEYS + _QTY_KEYS + _PRICE_KEYS + _AMOUNT_LIKE):
+            hits += 1
+    if hits >= max(2, int(df.shape[1] * 0.4)):
+        df2 = df.copy()
+        df2.columns = df2.iloc[0]
+        df2 = df2.iloc[1:]
+        return df2
+    return df
 
 
-def _sheet_key(name: str) -> List[str]:
-    tokens = [w for w in _norm(name).split() if w not in _SHEET_STOP]
-    return tokens
+def _clean_series(s: pd.Series) -> pd.Series:
+    return s.map(_strip).fillna("")
 
+# -----------------------
+# Парсинг BOQ (Excel)
+# -----------------------
 
-def _jaccard(a: List[str], b: List[str]) -> float:
-    A, B = set(a), set(b)
-    if not A and not B:
-        return 0.0
-    return len(A & B) / len(A | B)
-
-
-# ============================ unit normalization ============================
-
-_UNIT_MAP = {
-    # pieces
-    "шт": "pcs", "шт.": "pcs", "piece": "pcs", "pcs": "pcs", "pc": "pcs",
-    "ც": "pcs", "ცალი": "pcs", "ცალ": "pcs",
-    # meter
-    "м": "m", "м.": "m", "meter": "m", "m": "m", "მ": "m",
-    # m2
-    "м2": "m2", "м^2": "m2", "м²": "m2", "sqm": "m2", "m2": "m2", "მ2": "m2", "მ^2": "m2",
-    # m3
-    "м3": "m3", "м^3": "m3", "м³": "m3", "m3": "m3", "მ3": "m3", "მ^3": "m3",
-    # kg
-    "кг": "kg", "kg": "kg",
-    # set
-    "компл": "set", "комплект": "set", "set": "set",
-}
-
-def _norm_unit(u: str) -> str:
-    if not u:
-        return ""
-    base = _norm(u).replace(".", "")
-    return _UNIT_MAP.get(base, base)
-
-
-# ============================ BOQ (multi-sheet -> single) ============================
 
 def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
-    all_sheets = _read_all_sheets_from_bytes(boq_bytes)
-    rows = []
+    """
+    Читаем все листы Excel и собираем BOQ в одну таблицу:
+    No | Description | Unit | Qty
+    """
+    xls = pd.ExcelFile(io.BytesIO(boq_bytes))
+    parts: List[pd.DataFrame] = []
 
-    for sheet_name, df in all_sheets.items():
-        df = df.dropna(how="all").dropna(axis=1, how="all")
-        df = _raise_header_if_first_row_looks_like_headers(df).dropna(how="all")
-        if not _valid_data_sheet(df):
+    for sh in xls.sheet_names:
+        try:
+            df_raw = pd.read_excel(xls, sheet_name=sh, header=0, dtype=str)
+        except Exception:
+            continue
+        if df_raw.empty:
             continue
 
-        cols_lower = {str(c).strip().lower(): c for c in df.columns}
+        df_raw = _raise_header_if_first_row_looks_like_headers(df_raw)
+        df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all")
+        if df_raw.empty:
+            continue
+
+        cols_lower = {str(c).strip().lower(): c for c in df_raw.columns}
 
         c_desc = _pick_by_name(cols_lower, _DESC_KEYS)
-        c_qty = _pick_by_name(cols_lower, _QTY_KEYS)
         c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
+        c_qty = _pick_by_name(cols_lower, _QTY_KEYS)
+        c_no = None
+        for k in ["no", "№", "n°", "nº", "item", "position", "poz", "აქტი", "№ п/п"]:
+            if k in cols_lower:
+                c_no = cols_lower[k]
+                break
 
-        if not c_qty:
-            c_qty = _first_numeric_col(df, exclude=set())
-        if not c_desc:
-            scores = []
-            for c in df.columns:
-                s = _clean_series(df[c])
-                scores.append((s.map(len).mean(), c))
-            scores.sort(reverse=True)
-            c_desc = scores[0][1]
+        if c_desc is None or c_qty is None:
+            # Фолбэк: возьмём первые 3 колонки «как есть»
+            # и попытаемся интерпретировать.
+            df_try = df_raw.copy()
+            if df_try.shape[1] >= 3:
+                df_try.columns = ["Description", "Unit", "Qty"] + list(df_try.columns[3:])
+                c_desc, c_unit, c_qty = "Description", "Unit", "Qty"
+            else:
+                continue
 
-        desc = _clean_series(df[c_desc])
-        qty = pd.to_numeric(df[c_qty], errors="coerce").fillna(0)
-        unit = _clean_series(df[c_unit]) if c_unit else pd.Series([""] * len(df))
-
-        part = pd.DataFrame({
-            "Description": desc,
-            "Unit": unit.map(_norm_unit),
-            "Qty": qty,
-            "BOQ Sheet": sheet_name,
+        df = pd.DataFrame({
+            "Description": _clean_series(df_raw[c_desc]),
+            "Unit": _clean_series(df_raw[c_unit]) if c_unit else "",
+            "Qty": df_raw[c_qty].apply(_to_float),
         })
-        part["desc_key"] = part["Description"].map(_norm)
-        part["unit_key"] = part["Unit"].map(_norm_unit)
-        part["boq_sheet_key"] = part["BOQ Sheet"].map(_sheet_key)
-        part = part[~((part["desc_key"] == "") & (part["Qty"] == 0))]
-        if not part.empty:
-            rows.append(part)
+        if c_no:
+            df["No"] = _clean_series(df_raw[c_no])
+        else:
+            df["No"] = ""
 
-    if not rows:
-        raise ValueError("BOQ: подходящих листов не найдено")
+        df["Unit"] = df["Unit"].map(_norm_unit)
+        df = df[~((df["Description"] == "") & (df["Qty"] <= 0))]
 
-    out = pd.concat(rows, ignore_index=True)
-    out.reset_index(drop=True, inplace=True)
-    out.insert(0, "No", range(1, len(out) + 1))
+        if df.empty:
+            continue
+
+        # Если 'No' пусто во всех строках — создадим авто-нумерацию
+        if (df["No"] == "").all():
+            df["No"] = range(1, len(df) + 1)
+        else:
+            # попытаемся привести к числам там, где это возможно
+            df["No"] = df["No"].replace("", np.nan)
+            df["No"] = pd.to_numeric(df["No"], errors="ignore")
+
+        parts.append(df[["No", "Description", "Unit", "Qty"]])
+
+    if not parts:
+        raise ValueError("BOQ: не найдено пригодных листов/колонок.")
+
+    out = pd.concat(parts, ignore_index=True)
+    # Никакой «BOQ Sheet» — по твоей просьбе.
     return out
 
 
-# ============================ RFQ parsers ============================
+# -----------------------
+# Парсинг RFQ (Excel / PDF)
+# -----------------------
 
 def _parse_rfq_excel(rfq_bytes: bytes) -> pd.DataFrame:
-    all_sheets = _read_all_sheets_from_bytes(rfq_bytes)
-    rows = []
-    for sheet_name, df in all_sheets.items():
-        df = df.dropna(how="all").dropna(axis=1, how="all")
-        df = _raise_header_if_first_row_looks_like_headers(df).dropna(how="all")
-        if not _valid_data_sheet(df):
+    xls = pd.ExcelFile(io.BytesIO(rfq_bytes))
+    rows: List[pd.DataFrame] = []
+
+    for sh in xls.sheet_names:
+        try:
+            df_raw = pd.read_excel(xls, sheet_name=sh, header=0, dtype=str)
+        except Exception:
+            continue
+        if df_raw.empty:
             continue
 
-        cols_lower = {str(c).strip().lower(): c for c in df.columns}
-        c_desc = _pick_by_name(cols_lower, _DESC_KEYS)
+        df_raw = _raise_header_if_first_row_looks_like_headers(df_raw)
+        df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all")
+        if df_raw.empty:
+            continue
+
+        cols_lower = {str(c).strip().lower(): c for c in df_raw.columns}
+
+        c_desc = _pick_by_name(cols_lower, _DESC_KEYS) or df_raw.columns[0]
         c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
         c_price = _pick_by_name(cols_lower, _PRICE_KEYS)
 
-        if not c_desc:
-            text_scores = []
-            for c in df.columns:
-                if df[c].dtype == "O":
-                    s = _clean_series(df[c])
-                    text_scores.append((s.map(len).mean(), c))
-            text_scores.sort(reverse=True)
-            c_desc = text_scores[0][1] if text_scores else df.columns[0]
-
-        # если явной цены нет — пробуем Amount/Total ÷ Qty
-        if not c_price:
-            c_amount = None
-            for k, orig in cols_lower.items():
-                if any(w in k for w in _AMOUNT_LIKE):
-                    c_amount = orig
-                    break
+        # Попробуем вывести Unit Price из Amount/Total и Qty
+        if c_price is None:
+            c_amount = next((orig for k, orig in cols_lower.items()
+                             if any(w in k for w in _AMOUNT_LIKE)), None)
             qcol = _pick_by_name(cols_lower, _QTY_KEYS)
-            if c_amount and qcol:
-                df["__computed_price__"] = df[c_amount].apply(_to_float) / df[qcol].apply(_to_float).replace(0, pd.NA)
+            if c_amount is not None and qcol is not None:
+                amt = df_raw[c_amount].apply(_to_float)
+                qty = df_raw[qcol].apply(_to_float).replace(0, pd.NA)
+                df_raw["__computed_price__"] = (amt / qty).fillna(0)
                 c_price = "__computed_price__"
 
-        if not c_price:
-            # как минимум найдём числовую колонку
+        if c_price is None:
+            # как фолбэк — первая «числовая» колонка (не Qty)
             exclude = set()
-            q = _pick_by_name(cols_lower, _QTY_KEYS)
-            if q:
-                exclude.add(q)
-            c_price = _first_numeric_col(df, exclude)
-
-        if not c_price:
+            qcol = _pick_by_name(cols_lower, _QTY_KEYS)
+            if qcol is not None:
+                exclude.add(qcol)
+            c_price = _first_numeric_col(df_raw, exclude)
+        if c_price is None:
             continue
 
         part = pd.DataFrame({
-            "Description": _clean_series(df[c_desc]),
-            "Unit": _clean_series(df[c_unit]) if c_unit else pd.Series([""] * len(df)),
-            "Unit Price": df[c_price].apply(_to_float),
-            "RFQ Sheet": sheet_name,
+            "Description": _clean_series(df_raw[c_desc]),
+            "Unit": _clean_series(df_raw[c_unit]) if c_unit else pd.Series([""] * len(df_raw)),
+            "Unit Price": df_raw[c_price].apply(_to_float),
+            "RFQ Sheet": sh,
         })
         part["desc_key"] = part["Description"].map(_norm)
         part["unit_key"] = part["Unit"].map(_norm_unit)
@@ -287,30 +311,24 @@ def _parse_rfq_excel(rfq_bytes: bytes) -> pd.DataFrame:
             rows.append(part)
 
     if not rows:
-        raise ValueError("RFQ: ценовые листы не найдены (xlsx)")
-
+        raise ValueError("RFQ(Excel): не найдено ценовых таблиц.")
     return pd.concat(rows, ignore_index=True)
 
 
 def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
-    try:
-        import pdfplumber
-    except ImportError:
-        raise RuntimeError("pdfplumber не установлен — PDF RFQ не поддержаны")
-
+    import pdfplumber
     rows = []
     with pdfplumber.open(io.BytesIO(rfq_bytes)) as pdf:
         for i, page in enumerate(pdf.pages, 1):
-            # header tokens для «ключа листа»
+            # заголовок страницы -> surrogate "sheet"
             try:
-                words = page.extract_words()
-                h = page.height
-                header_text = " ".join(w["text"] for w in words if w["top"] < 0.18 * h)
+                words = page.extract_words() or []
+                h = page.height or 1
+                header_text = " ".join(w.get("text", "") for w in words if w.get("top", 1e9) < 0.18 * h)
             except Exception:
                 header_text = ""
-            rfq_sheet_name = f"page {i}: " + (header_text[:40] if header_text else "")
+            rfq_sheet_label = (header_text[:40] or f"page {i}")
 
-            # пробуем две стратегии извлечения таблиц
             strategies = [
                 dict(vertical_strategy="lines", horizontal_strategy="lines",
                      intersection_tolerance=5, snap_tolerance=3, join_tolerance=3, edge_min_length=40),
@@ -320,75 +338,54 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
             tables = []
             for st in strategies:
                 try:
-                    tables = page.extract_tables(st)
-                    if tables:
+                    t = page.extract_tables(st) or []
+                    if t:
+                        tables = t
                         break
                 except Exception:
                     continue
-
             if not tables:
-                # без таблиц — попробуем «строчник»: очень грубо
-                txt = page.extract_text() or ""
-                lines = [l.strip() for l in txt.splitlines() if l.strip()]
-                for ln in lines:
-                    # эвристика: "... qty price amount" — игнорируем
-                    pass
-                # нет надёжной таблицы — пропускаем страницу
-                continue
+                continue  # страница без таблиц – ок
 
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
                     continue
-                df = pd.DataFrame(tbl[1:], columns=tbl[0])
-                df = df.dropna(how="all").dropna(axis=1, how="all")
+                df = pd.DataFrame(tbl[1:], columns=tbl[0]).dropna(how="all").dropna(axis=1, how="all")
                 if df.empty:
                     continue
-
                 df = _raise_header_if_first_row_looks_like_headers(df).dropna(how="all")
                 if df.empty:
                     continue
 
                 cols_lower = {str(c).strip().lower(): c for c in df.columns}
-                c_desc = _pick_by_name(cols_lower, _DESC_KEYS)
+                c_desc = _pick_by_name(cols_lower, _DESC_KEYS) or df.columns[0]
                 c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
                 c_price = _pick_by_name(cols_lower, _PRICE_KEYS)
 
-                if not c_desc:
-                    # choose most "texty"
-                    text_scores = []
-                    for c in df.columns:
-                        s = _clean_series(df[c])
-                        text_scores.append((s.map(len).mean(), c))
-                    text_scores.sort(reverse=True)
-                    c_desc = text_scores[0][1]
-
-                if not c_price:
-                    c_amount = None
-                    for k, orig in cols_lower.items():
-                        if any(w in k for w in _AMOUNT_LIKE):
-                            c_amount = orig
-                            break
+                if c_price is None:
+                    c_amount = next((orig for k, orig in cols_lower.items()
+                                     if any(w in k for w in _AMOUNT_LIKE)), None)
                     qcol = _pick_by_name(cols_lower, _QTY_KEYS)
-                    if c_amount and qcol:
-                        df["__computed_price__"] = df[c_amount].apply(_to_float) / df[qcol].apply(_to_float).replace(0, pd.NA)
+                    if c_amount is not None and qcol is not None:
+                        amt = df[c_amount].apply(_to_float)
+                        qty = df[qcol].apply(_to_float).replace(0, pd.NA)
+                        df["__computed_price__"] = (amt / qty).fillna(0)
                         c_price = "__computed_price__"
 
-                if not c_price:
-                    # fallback: первая числовая
+                if c_price is None:
                     exclude = set()
-                    q = _pick_by_name(cols_lower, _QTY_KEYS)
-                    if q:
-                        exclude.add(q)
+                    qcol = _pick_by_name(cols_lower, _QTY_KEYS)
+                    if qcol is not None:
+                        exclude.add(qcol)
                     c_price = _first_numeric_col(df, exclude)
-
-                if not c_price:
+                if c_price is None:
                     continue
 
                 part = pd.DataFrame({
                     "Description": _clean_series(df[c_desc]),
                     "Unit": _clean_series(df[c_unit]) if c_unit else pd.Series([""] * len(df)),
                     "Unit Price": df[c_price].apply(_to_float),
-                    "RFQ Sheet": rfq_sheet_name,
+                    "RFQ Sheet": rfq_sheet_label,
                 })
                 part["desc_key"] = part["Description"].map(_norm)
                 part["unit_key"] = part["Unit"].map(_norm_unit)
@@ -398,147 +395,112 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
                     rows.append(part)
 
     if not rows:
-        raise ValueError("RFQ: не удалось извлечь ценовые таблицы из PDF (вероятно скан).")
-
+        raise ValueError("RFQ(PDF): пригодных ценовых таблиц не найдено (возможно, скан/инвойс).")
     return pd.concat(rows, ignore_index=True)
 
 
 def parse_rfq(rfq_bytes: bytes) -> pd.DataFrame:
-    # Авто-детект PDF
-    head = rfq_bytes[:8]
-    if isinstance(head, bytes) and b"%PDF" in head:
+    """Авто-детект: PDF или Excel."""
+    head = bytes(rfq_bytes[:5])
+    if head.startswith(b"%PDF-"):
         return _parse_rfq_pdf(rfq_bytes)
-    # иначе считаем Excel
-    return _parse_rfq_excel(rfq_bytes)
+    try:
+        return _parse_rfq_excel(rfq_bytes)
+    except Exception:
+        # на случай «xlsm, но по факту pdf» и прочего
+        return _parse_rfq_pdf(rfq_bytes)
 
 
-# ============================ fuzzy matching ============================
+# -----------------------
+# Сведение по поставщикам
+# -----------------------
 
-def _best_match_key(dk: str, supplier_keys: List[str]) -> Optional[str]:
-    if not dk:
-        return None
-    if dk in supplier_keys:
-        return dk
-    pref = dk[:24]
-    for k in supplier_keys:
-        if k.startswith(pref) or dk.startswith(k):
-            return k
-    t = set(dk.split())
-    best_k, best_s = None, 0.0
-    for k in supplier_keys:
-        tt = set(k.split())
-        if not tt:
+def _build_rfq_index(df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[float, str]]:
+    """
+    Индекс по (desc_key, unit_key) -> (unit_price, rfq_sheet_label).
+    При повторе ключа берём ПЕРВОЕ встреченное точное совпадение.
+    """
+    idx: Dict[Tuple[str, str], Tuple[float, str]] = {}
+    for _, r in df.iterrows():
+        key = (r.get("desc_key", ""), r.get("unit_key", ""))
+        if key not in idx:
+            idx[key] = (float(r["Unit Price"]), str(r.get("RFQ Sheet", "")))
+    return idx
+
+
+def align_offers(boq_df: pd.DataFrame, supplier_to_rfq: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    На вход: BOQ (No, Description, Unit, Qty) и словарь {supplier_name: rfq_df}.
+    Возврат: итоговая таблица для Google Sheets.
+    """
+    base = boq_df.copy()
+    # нормализованные ключи для матчинга
+    base["desc_key"] = base["Description"].map(_norm)
+    base["unit_key"] = base["Unit"].map(_norm_unit)
+
+    table = base[["No", "Description", "Unit", "Qty"]].copy()
+
+    for supplier, rfq_df in supplier_to_rfq.items():
+        unit_col = f"{supplier}: Unit Price"
+        total_col = f"{supplier}: Total"
+        match_col = f"{supplier}: Match"
+        notes_col = f"{supplier}: Notes"
+
+        table[unit_col] = 0.0
+        table[total_col] = 0.0
+        table[match_col] = "—"
+        table[notes_col] = ""
+
+        if rfq_df is None or rfq_df.empty:
+            table[notes_col] = "No RFQ"
             continue
-        inter = len(t & tt)
-        union = len(t | tt)
-        s = inter / union
-        if s > 0.58 and s > best_s:
-            best_k, best_s = k, s
-    return best_k
 
+        idx = _build_rfq_index(rfq_df)
 
-# ============================ alignment ============================
+        # матчим
+        prices = []
+        totals = []
+        matches = []
+        notes = []
 
-def align_offers(boq: pd.DataFrame, supplier_to_df: Dict[str, pd.DataFrame]) -> Tuple[List[str], pd.DataFrame]:
-    suppliers = sorted(supplier_to_df.keys())
-    base = boq.copy()
-
-    for s in suppliers:
-        base[(s, "Unit Price")] = 0.0
-        base[(s, "Total")] = 0.0
-        base[(s, "Match")] = ""
-        base[(s, "Notes")] = ""
-
-    for s, df in supplier_to_df.items():
-        by_sheet: Dict[str, pd.DataFrame] = {}
-        for sh, sub in df.groupby("RFQ Sheet"):
-            by_sheet[sh] = sub.copy()
-
-        global_desc_keys = df["desc_key"].tolist()
-
-        prices, totals, matches, notes = [], [], [], []
         for _, row in base.iterrows():
-            dk = row["desc_key"]
-            uk = row.get("unit_key", "")
-            qty = float(row["Qty"])
-            boq_tokens = row.get("boq_sheet_key", [])
+            key = (row["desc_key"], row["unit_key"])
+            q = float(row.get("Qty", 0))
+            hit = idx.get(key)
 
-            # ранжируем страницы/листы RFQ
-            sheet_scores = []
-            for sh, sub in by_sheet.items():
-                rfq_tokens = sub["rfq_sheet_key"].iloc[0] if not sub.empty else []
-                sim = _jaccard(boq_tokens, rfq_tokens)
-                sheet_scores.append((sim, sh))
-            sheet_scores.sort(reverse=True)
+            if hit:
+                price, sheet_lbl = hit
+                prices.append(price)
+                totals.append(round(price * q, 6))
+                matches.append("✅")
+                notes.append(f"Exact in sheet: {sheet_lbl}")
+            else:
+                # попробуем игнорировать unit (бывает разнобой в RFQ)
+                key2 = (row["desc_key"], "")
+                hit2 = idx.get(key2)
+                if hit2:
+                    price, sheet_lbl = hit2
+                    prices.append(price)
+                    totals.append(round(price * q, 6))
+                    matches.append("❗")
+                    notes.append(f"Unit mismatch in: {sheet_lbl}")
+                else:
+                    prices.append(0.0)
+                    totals.append(0.0)
+                    matches.append("—")
+                    notes.append("No line in RFQ")
 
-            price = 0.0
-            match_tag = "—"
-            note = "No line in RFQ"
+        table[unit_col] = prices
+        table[total_col] = totals
+        table[match_col] = matches
+        table[notes_col] = notes
 
-            for sim, sh in sheet_scores:
-                sub = by_sheet[sh]
+    # финал: отсортируем No по возможности, остальное — как есть
+    try:
+        table = table.sort_values(
+            by=["No"], key=lambda s: pd.to_numeric(s, errors="coerce")
+        ).reset_index(drop=True)
+    except Exception:
+        pass
 
-                exact_du = sub[(sub["desc_key"] == dk) & (sub["unit_key"] == uk)]
-                if not exact_du.empty:
-                    price = float(exact_du["Unit Price"].iloc[0]); match_tag = "✅"; note = f"Exact in sheet: {sh}"; break
-
-                exact_d = sub[sub["desc_key"] == dk]
-                if not exact_d.empty:
-                    price = float(exact_d["Unit Price"].iloc[0])
-                    if uk and uk not in exact_d["unit_key"].tolist():
-                        match_tag = "❗"; note = f"Unit mismatch in sheet: {sh}"
-                    else:
-                        match_tag = "✅"; note = f"Exact (any unit) in sheet: {sh}"
-                    break
-
-                cand_keys = sub["desc_key"].unique().tolist()
-                dk2 = _best_match_key(dk, cand_keys)
-                if dk2:
-                    sub2 = sub[sub["desc_key"] == dk2]
-                    same_unit = sub2[sub2["unit_key"] == uk]
-                    pick = same_unit.iloc[0] if not same_unit.empty else sub2.iloc[0]
-                    price = float(pick["Unit Price"])
-                    if not same_unit.empty:
-                        match_tag = "✅"; note = f"Fuzzy (same unit) in sheet: {sh}"
-                    else:
-                        match_tag = "❗" if uk and uk != pick["unit_key"] else "✅"
-                        note = f"Fuzzy in sheet: {sh}"
-                    break
-
-            if price == 0.0:
-                dk2 = _best_match_key(dk, global_desc_keys)
-                if dk2:
-                    sub2 = df[df["desc_key"] == dk2]
-                    same_unit = sub2[sub2["unit_key"] == uk]
-                    pick = same_unit.iloc[0] if not same_unit.empty else sub2.iloc[0]
-                    price = float(pick["Unit Price"])
-                    if not same_unit.empty:
-                        match_tag = "✅"; note = "Fuzzy (global, same unit)"
-                    else:
-                        match_tag = "❗" if uk and uk != pick["unit_key"] else "✅"
-                        note = "Fuzzy (global)"
-
-            prices.append(price)
-            totals.append(price * qty)
-            matches.append(match_tag)
-            notes.append(note)
-
-        base[(s, "Unit Price")] = prices
-        base[(s, "Total")] = totals
-        base[(s, "Match")] = matches
-        base[(s, "Notes")] = notes
-
-    # финальный «плоский» отчёт: без BOQ Sheet
-    cols = ["No", "Description", "Unit", "Qty"]
-    for s in suppliers:
-        cols += [(s, "Unit Price"), (s, "Total"), (s, "Match"), (s, "Notes")]
-
-    flat = pd.DataFrame()
-    for c in cols:
-        if isinstance(c, tuple):
-            flat[f"{c[0]}: {c[1]}"] = base[c]
-        else:
-            if c in base.columns:
-                flat[c] = base[c]
-
-    return suppliers, flat
+    return table
