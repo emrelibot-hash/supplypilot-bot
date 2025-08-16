@@ -1,72 +1,196 @@
+from __future__ import annotations
+
+import io
 import os
+import re
+from typing import List, Dict, Any, Optional, Tuple
+
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 
-# Загружаем ключи
-SERVICE_ACCOUNT_FILE = "credentials.json"
+# ===== CONFIG =====
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+SERVICE_ACCOUNT_FILE = "credentials.json"
 
-# Инициализация клиента Google Drive
-credentials = service_account.Credentials.from_service_account_file(
+# ID корневой папки Projects (НЕ папки конкретного проекта)
+# Можно оставить хардкод или пробросить через env:
+ROOT_FOLDER_ID = os.getenv("GOOGLE_FOLDER_ID", "1J85RsAoGbCAbE8kEtgYRIPLbRcfph1zP")
+
+# ===== CLIENT =====
+creds = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE, scopes=SCOPES
 )
-drive_service = build("drive", "v3", credentials=credentials)
+drive_service = build("drive", "v3", credentials=creds)
 
-# ID корневой папки с проектами
-ROOT_FOLDER_ID = os.getenv("GOOGLE_FOLDER_ID")
 
-def list_folders_in_folder(folder_id):
-    """Возвращает список подпапок внутри указанной папки."""
-    try:
-        query = f"'{folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed=false"
-        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        return results.get("files", [])
-    except HttpError as error:
-        print(f"Ошибка при получении списка папок: {error}")
+# ===== LOW-LEVEL HELPERS =====
+def list_folders_in_folder(parent_id: str) -> List[Dict[str, Any]]:
+    """Папки внутри parent_id."""
+    results = drive_service.files().list(
+        q=(
+            f"'{parent_id}' in parents and "
+            f"mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        ),
+        pageSize=1000,
+        fields="files(id,name)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    return results.get("files", [])
+
+
+def list_files_in_folder(folder_id: str) -> List[Dict[str, Any]]:
+    """Файлы (любой тип) внутри folder_id."""
+    results = drive_service.files().list(
+        q=f"'{folder_id}' in parents and trashed = false",
+        pageSize=1000,
+        fields="files(id,name,mimeType)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
+    return results.get("files", [])
+
+
+def download_file(file_id: str) -> bytes:
+    """Скачивает файл по ID и возвращает bytes."""
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _status, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh.read()
+
+
+def _find_subfolder_by_name(parent_id: str, expected: str) -> Optional[Dict[str, Any]]:
+    """Ищет подпапку с именем expected (регистронезависимо, без лишних пробелов)."""
+    expected_norm = expected.strip().lower()
+    for f in list_folders_in_folder(parent_id):
+        if f["name"].strip().lower() == expected_norm:
+            return f
+    return None
+
+
+# ===== BOQ / RFQ DISCOVERY =====
+def find_boq_file(project_folder_id: str) -> Tuple[Optional[str], Optional[bytes]]:
+    """
+    Ищем подпапку 'boq' (латиница, строчные). Берём первый файл.
+    Возвращаем (имя_файла, bytes) либо (None, None).
+    """
+    boq_folder = _find_subfolder_by_name(project_folder_id, "boq")
+    if not boq_folder:
+        print("[WARN] 'boq' folder not found")
+        return None, None
+
+    boq_files = list_files_in_folder(boq_folder["id"])
+    if not boq_files:
+        print("[WARN] No files in 'boq'")
+        return None, None
+
+    boq_file = boq_files[0]
+    print(f"[INFO] BOQ file: {boq_file['name']}")
+    return boq_file["name"], download_file(boq_file["id"])
+
+
+_SUPPLIER_BLACKLIST = {
+    "rfq", "kp", "kz", "offer", "quotation", "quote", "price", "proposal",
+    "коммерческое", "кп", "предложение", "оффер"
+}
+
+def _guess_supplier_from_filename(filename: str) -> str:
+    """
+    Имя файла -> имя поставщика (простая, но практичная эвристика).
+    """
+    base = os.path.splitext(filename)[0]
+    tokens = re.split(r"[\s._\-]+", base)
+    cleaned = [t for t in tokens if t and t.lower() not in _SUPPLIER_BLACKLIST and not t.isdigit()]
+    if cleaned:
+        return " ".join(cleaned[:2]).strip()
+    return base.strip()
+
+
+def find_rfq_files(project_folder_id: str) -> List[Dict[str, Any]]:
+    """
+    Ищем предложения в подпапке 'rfq' (без подпапок).
+    Fallback: 'кп' / 'kp' — для обратной совместимости.
+    Возвращаем список элементов: {"supplier", "filename", "bytes"}.
+    """
+    rfq_folder = (
+        _find_subfolder_by_name(project_folder_id, "rfq")
+        or _find_subfolder_by_name(project_folder_id, "кп")
+        or _find_subfolder_by_name(project_folder_id, "kp")
+    )
+    if not rfq_folder:
+        print("[WARN] 'rfq' folder not found (also no 'кп'/'kp')")
         return []
 
-def list_files_in_folder(folder_id):
-    """Возвращает список файлов внутри указанной папки."""
+    offers: List[Dict[str, Any]] = []
+    files = list_files_in_folder(rfq_folder["id"])
+    for f in files:
+        # пропускаем подпапки (на всякий)
+        if f.get("mimeType") == "application/vnd.google-apps.folder":
+            continue
+        try:
+            content = download_file(f["id"])
+            supplier = _guess_supplier_from_filename(f["name"])
+            offers.append({"supplier": supplier, "filename": f["name"], "bytes": content})
+        except Exception as e:
+            print(f"[ERROR] download RFQ '{f['name']}': {e}")
+
+    print(f"[INFO] RFQ files found: {len(offers)}")
+    return offers
+
+
+# ===== PUBLIC API (единый контракт) =====
+def get_projects_from_drive(root_folder_id: Optional[str] = None, *_args, **_kwargs) -> List[Dict[str, Any]]:
+    """
+    Возвращает список проектов в формате ЕДИНОГО контракта:
+
+    {
+      "project_name": str,
+      "boq_file": str | None,
+      "boq_bytes": bytes | None,
+      "offers": [
+        {"supplier": str, "filename": str, "bytes": bytes}
+      ]
+    }
+
+    Параметры:
+      - root_folder_id: опционально переопределяет ROOT_FOLDER_ID
+      - *_args, **_kwargs: «проглатывают» лишние аргументы, если функция вызвана как колбэк
+    """
+    folder_id = root_folder_id or ROOT_FOLDER_ID
+    projects: List[Dict[str, Any]] = []
+
+    # sanity
     try:
-        query = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed=false"
-        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        return results.get("files", [])
-    except HttpError as error:
-        print(f"Ошибка при получении списка файлов: {error}")
-        return []
+        root = drive_service.files().get(fileId=folder_id, fields="id,name").execute()
+        print(f"[INFO] Scanning ROOT: {root.get('name')} ({root.get('id')})")
+    except Exception as e:
+        print(f"[ERROR] Cannot access ROOT '{folder_id}': {e}")
+        return projects
 
-def get_projects_from_drive():
-    """
-    Сканирует корневую папку и собирает:
-    - BOQ файл
-    - список RFQ файлов (каждый = поставщик)
-    """
-    projects = []
+    project_folders = list_folders_in_folder(folder_id)
+    print(f"[INFO] Project folders discovered: {len(project_folders)}")
 
-    project_folders = list_folders_in_folder(ROOT_FOLDER_ID)
-    for project in project_folders:
-        project_id = project["id"]
-        project_name = project["name"]
+    for pf in project_folders:
+        print(f"[INFO] Project: {pf['name']} ({pf['id']})")
+        boq_name, boq_bytes = find_boq_file(pf["id"])
+        if not boq_bytes:
+            print("[WARN] Skip project — BOQ missing")
+            continue
 
-        # Ищем подпапки boq и rfq
-        subfolders = list_folders_in_folder(project_id)
-        boq_file = None
-        rfq_files = []
+        offers = find_rfq_files(pf["id"])
+        projects.append(
+            {
+                "project_name": pf["name"],
+                "boq_file": boq_name,
+                "boq_bytes": boq_bytes,
+                "offers": offers,
+            }
+        )
 
-        for sf in subfolders:
-            if sf["name"].lower() == "boq":
-                boq_files = list_files_in_folder(sf["id"])
-                if boq_files:
-                    boq_file = boq_files[0]  # берем только один файл
-            elif sf["name"].lower() == "rfq":
-                rfq_files = list_files_in_folder(sf["id"])  # список файлов
-
-        if boq_file and rfq_files:
-            projects.append({
-                "name": project_name,
-                "boq": boq_file,
-                "rfqs": rfq_files
-            })
-
+    print(f"[INFO] Total projects ready: {len(projects)}")
     return projects
