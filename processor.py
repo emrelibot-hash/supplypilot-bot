@@ -6,11 +6,11 @@
 Выходная таблица для Google Sheets:
     No | Description | Unit | Qty | <Supplier A: Unit Price> | <Supplier A: Total> | <Supplier A: Match> | <Supplier A: Notes> | <Supplier B: ...> | ...
 
-Особенности:
+Политика:
 - BOQ: читаем ВСЕ листы и собираем в одну таблицу (No / Description / Unit / Qty). Колонки "BOQ Sheet" нет.
-- RFQ: читаем ВСЕ листы (Excel и PDF), агрегируем построчно (игнорируем имя листа при матчинге, но пишем его в Notes).
-- Матчинг по exact (Description+Unit) с фолбэком на (Description+empty unit). При множественных дублях берём ПЕРВОЕ точное совпадение, не минимальную цену.
-- PDF: используем pdfplumber; если таблиц нет (скан/инвойс), пропускаем без падения.
+- RFQ: читаем ВСЕ листы (Excel и PDF), агрегируем построчно (имя листа не влияет на матчинг, но пишем его в Notes).
+- Матчинг по exact (Description+Unit) с фолбэком на (Description+empty unit). Дубликаты не схлопываем — берем ПЕРВОЕ точное совпадение.
+- PDF (pdfplumber): если таблиц нет (скан/инвойс), пропускаем без падения.
 
 Зависимости: pandas, numpy, openpyxl, pdfplumber (для PDF).
 """
@@ -45,19 +45,12 @@ _AMOUNT_LIKE = [
 ]
 
 _UNIT_CANON_MAP = {
-    # штука
     "pcs": {"pc", "pcs", "шт", "шт.", "ც", "ც.", "piece", "pieces"},
-    # комплект
     "set": {"set", "компл", "компл.", "კომპლ", "კომპლ.", "kit"},
-    # метр
     "m": {"m", "м", "მ", "meter", "метр"},
-    # квадратный метр
     "sqm": {"m2", "м2", "მ2", "sqm", "sq m", "sq. m", "sq.m"},
-    # кубометр
     "m3": {"m3", "м3", "მ3", "cubic m", "cu m", "cu.m"},
-    # килограмм
     "kg": {"kg", "кг"},
-    # литр/сек (пример)
     "l/s": {"l/s", "lps", "lps.", "ლ/წმ"},
 }
 
@@ -66,8 +59,8 @@ _UNIT_CANON_MAP = {
 # -----------------------
 
 _ws = re.compile(r"\s+")
-_commas = re.compile(r"(?!^),(?=.*\d)")               # запятые как разделители тысяч
-_spaces_in_num = re.compile(r"(?<=\d) (?=\d)")        # 12 345 -> 12345
+_commas = re.compile(r"(?!^),(?=.*\d)")
+_spaces_in_num = re.compile(r"(?<=\d) (?=\d)")
 
 
 def _strip(val) -> str:
@@ -80,7 +73,6 @@ def _strip(val) -> str:
 
 
 def _norm(txt: str) -> str:
-    """Нормализованный ключ описания для сравнения."""
     s = _strip(txt).lower()
     s = s.replace(",", " ").replace(";", " ").replace("—", "-")
     s = _ws.sub(" ", s)
@@ -92,7 +84,6 @@ def _norm_unit(u: str) -> str:
     for canon, variants in _UNIT_CANON_MAP.items():
         if u0 in variants:
             return canon
-    # частные случаи: одиночные буквы часто с/без точки
     if u0 in {"шт", "шт."}:
         return "pcs"
     if u0 in {"м2", "м^2", "м²", "m^2"}:
@@ -109,7 +100,6 @@ def _sheet_key(s: str) -> str:
 
 
 def _to_float(x) -> float:
-    """Конверсия чисел с поддержкой '12 345,67' и '12,345.67' и валютных символов."""
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return 0.0
     s = str(x).strip()
@@ -117,17 +107,14 @@ def _to_float(x) -> float:
         return 0.0
     s = _spaces_in_num.sub("", s)
     s = _commas.sub("", s)
-    # если запятая как десятичный разделитель
     if s.count(",") == 1 and s.count(".") == 0:
         s = s.replace(",", ".")
-    # убираем валюту
     s = re.sub(r"[$₾€₽£]", "", s)
     try:
         return float(s)
     except Exception:
         try:
-            s2 = s.replace(" ", "")
-            return float(s2)
+            return float(s.replace(" ", ""))
         except Exception:
             return 0.0
 
@@ -155,7 +142,6 @@ def _first_numeric_col(df: pd.DataFrame, exclude: Iterable[str] = ()) -> Optiona
 
 
 def _raise_header_if_first_row_looks_like_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Если первая строка похожа на шапку — поднимем её в заголовки."""
     row0 = df.iloc[0].astype(str).str.lower().str.strip()
     hits = 0
     for v in row0:
@@ -181,7 +167,6 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
     """
     Читаем все листы Excel и собираем BOQ в одну таблицу:
     No | Description | Unit | Qty
-    Устойчиво к «кривым» шапкам и отсутствующим названиям колонок.
     """
     xls = pd.ExcelFile(io.BytesIO(boq_bytes))
     parts: List[pd.DataFrame] = []
@@ -194,7 +179,6 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
         if df_raw.empty:
             continue
 
-        # Рабочая копия, где поднимаем возможную шапку
         df_work = _raise_header_if_first_row_looks_like_headers(df_raw)
         df_work = df_work.dropna(how="all").dropna(axis=1, how="all")
         if df_work.empty:
@@ -202,19 +186,18 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
 
         cols_lower = {str(c).strip().lower(): c for c in df_work.columns}
 
-        # Детект по названиям
         c_desc = _pick_by_name(cols_lower, _DESC_KEYS)
         c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
         c_qty  = _pick_by_name(cols_lower, _QTY_KEYS)
 
         # Номер позиции (если есть)
         c_no = None
-        for k in ["no", "№", "n°", "nº", "item", "position", "poz", "акт", "№ п/п"]:
+        for k in ["no", "№", "n°", "nº", "item", "position", "poz", "№ п/п"]:
             if k in cols_lower:
                 c_no = cols_lower[k]
                 break
 
-        # Фолбэк №1: тупо переименовать первые 3 колонки в Description/Unit/Qty
+        # Фолбэк №1: принудительно переименовать первые 3 колонки
         if c_desc is None or c_qty is None:
             df_try = df_work.copy()
             if df_try.shape[1] >= 3:
@@ -225,18 +208,17 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
                 }
                 df_try = df_try.rename(columns=rename_map)
                 c_desc, c_unit, c_qty = "Description", "Unit", "Qty"
-                df_work = df_try  # КРИТИЧЕСКИ ВАЖНО: дальше работаем уже с df_work!
+                df_work = df_try
             else:
-                # Фолбэк №2: эвристика — найдём Qty как «самую числовую»,
-                # затем возьмём первую не-Qty как Description, следующую — Unit.
-                if df_work.shape[1] == 0:
-                    continue
+                # Фолбэк №2: эвристика по "самой числовой" для Qty
                 shares = {c: pd.Series(df_work[c]).apply(_to_float).gt(0).mean() for c in df_work.columns}
                 c_qty = max(shares, key=lambda c: shares[c])
+                # Description — первая не-Qty
                 c_desc = next((c for c in df_work.columns if c != c_qty), df_work.columns[0])
+                # Unit — следующая свободная
                 c_unit = next((c for c in df_work.columns if c not in (c_desc, c_qty)), None)
 
-        # Безопасные серии (с выравниванием по индексу)
+        # Безопасные серии из ИМЕННО df_work (чтобы не ловить KeyError)
         idx = df_work.index
         desc_series = _clean_series(df_work[c_desc]) if (c_desc in df_work.columns) else pd.Series([""] * len(idx), index=idx)
         unit_series = _clean_series(df_work[c_unit]) if (c_unit and c_unit in df_work.columns) else pd.Series([""] * len(idx), index=idx)
@@ -252,14 +234,12 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
         # Колонка No
         if c_no and c_no in df_work.columns:
             no_series = _clean_series(df_work[c_no])
-            # если пусто у большинства — авто-нумерация
             if (no_series == "").mean() > 0.7:
                 no_series = pd.Series(range(1, len(df) + 1), index=df.index)
         else:
             no_series = pd.Series(range(1, len(df) + 1), index=df.index)
         df.insert(0, "No", no_series)
 
-        # Нормализация единиц и фильтрация мусора
         df["Unit"] = df["Unit"].map(_norm_unit)
         df = df[~((df["Description"] == "") & (df["Qty"] <= 0))]
         if df.empty:
@@ -271,7 +251,6 @@ def parse_boq(boq_bytes: bytes) -> pd.DataFrame:
         raise ValueError("BOQ: не найдено пригодных листов/колонок.")
 
     out = pd.concat(parts, ignore_index=True)
-    # По просьбе: никакой 'BOQ Sheet'
     return out
 
 
@@ -302,10 +281,8 @@ def _parse_rfq_excel(rfq_bytes: bytes) -> pd.DataFrame:
         c_unit = _pick_by_name(cols_lower, _UNIT_KEYS)
         c_price = _pick_by_name(cols_lower, _PRICE_KEYS)
 
-        # Попытка вывести Unit Price из Amount/Total и Qty
         if c_price is None:
-            c_amount = next((orig for k, orig in cols_lower.items()
-                             if any(w in k for w in _AMOUNT_LIKE)), None)
+            c_amount = next((orig for k, orig in cols_lower.items() if any(w in k for w in _AMOUNT_LIKE)), None)
             qcol = _pick_by_name(cols_lower, _QTY_KEYS)
             if c_amount is not None and qcol is not None:
                 amt = df_raw[c_amount].apply(_to_float)
@@ -314,7 +291,6 @@ def _parse_rfq_excel(rfq_bytes: bytes) -> pd.DataFrame:
                 c_price = "__computed_price__"
 
         if c_price is None:
-            # как фолбэк — первая «числовая» колонка (не Qty)
             exclude = set()
             qcol = _pick_by_name(cols_lower, _QTY_KEYS)
             if qcol is not None:
@@ -346,7 +322,6 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
     rows: List[pd.DataFrame] = []
     with pdfplumber.open(io.BytesIO(rfq_bytes)) as pdf:
         for i, page in enumerate(pdf.pages, 1):
-            # Заголовок страницы -> surrogate "sheet"
             try:
                 words = page.extract_words() or []
                 h = page.height or 1
@@ -371,7 +346,7 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
                 except Exception:
                     continue
             if not tables:
-                continue  # страница без таблиц — ок
+                continue
 
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
@@ -389,8 +364,7 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
                 c_price = _pick_by_name(cols_lower, _PRICE_KEYS)
 
                 if c_price is None:
-                    c_amount = next((orig for k, orig in cols_lower.items()
-                                     if any(w in k for w in _AMOUNT_LIKE)), None)
+                    c_amount = next((orig for k, orig in cols_lower.items() if any(w in k for w in _AMOUNT_LIKE)), None)
                     qcol = _pick_by_name(cols_lower, _QTY_KEYS)
                     if c_amount is not None and qcol is not None:
                         amt = df[c_amount].apply(_to_float)
@@ -426,14 +400,12 @@ def _parse_rfq_pdf(rfq_bytes: bytes) -> pd.DataFrame:
 
 
 def parse_rfq(rfq_bytes: bytes) -> pd.DataFrame:
-    """Авто-детект: PDF или Excel, с фолбэком."""
     head = bytes(rfq_bytes[:5])
     if head.startswith(b"%PDF-"):
         return _parse_rfq_pdf(rfq_bytes)
     try:
         return _parse_rfq_excel(rfq_bytes)
     except Exception:
-        # на случай «xlsm, но по факту pdf», битых файлов и т.п.
         return _parse_rfq_pdf(rfq_bytes)
 
 
@@ -444,7 +416,7 @@ def parse_rfq(rfq_bytes: bytes) -> pd.DataFrame:
 def _build_rfq_index(df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[float, str]]:
     """
     Индекс по (desc_key, unit_key) -> (unit_price, rfq_sheet_label).
-    При повторе ключа берём ПЕРВОЕ встреченное точное совпадение.
+    При повторе ключа берём ПЕРВОЕ точное совпадение.
     """
     idx: Dict[Tuple[str, str], Tuple[float, str]] = {}
     for _, r in df.iterrows():
@@ -454,19 +426,22 @@ def _build_rfq_index(df: pd.DataFrame) -> Dict[Tuple[str, str], Tuple[float, str
     return idx
 
 
-def align_offers(boq_df: pd.DataFrame, supplier_to_rfq: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def align_offers(boq_df: pd.DataFrame, supplier_to_rfq: Dict[str, pd.DataFrame]) -> Tuple[List[str], pd.DataFrame]:
     """
-    На вход: BOQ (No, Description, Unit, Qty) и словарь {supplier_name: rfq_df}.
-    Возврат: итоговая таблица для Google Sheets.
+    На вход: BOQ (No, Description, Unit, Qty) и {supplier_name: rfq_df}.
+    Возврат: (список поставщиков, итоговая таблица) — совместимо с твоим main.py.
     """
+    suppliers = list(supplier_to_rfq.keys())
+
     base = boq_df.copy()
-    # нормализованные ключи для матчинга
     base["desc_key"] = base["Description"].map(_norm)
     base["unit_key"] = base["Unit"].map(_norm_unit)
 
     table = base[["No", "Description", "Unit", "Qty"]].copy()
 
-    for supplier, rfq_df in supplier_to_rfq.items():
+    for supplier in suppliers:
+        rfq_df = supplier_to_rfq.get(supplier)
+
         unit_col = f"{supplier}: Unit Price"
         total_col = f"{supplier}: Total"
         match_col = f"{supplier}: Match"
@@ -500,7 +475,6 @@ def align_offers(boq_df: pd.DataFrame, supplier_to_rfq: Dict[str, pd.DataFrame])
                 matches.append("✅")
                 notes.append(f"Exact in sheet: {sheet_lbl}")
             else:
-                # фолбэк: игнорируем unit (бывает разнобой)
                 key2 = (row["desc_key"], "")
                 hit2 = idx.get(key2)
                 if hit2:
@@ -520,12 +494,9 @@ def align_offers(boq_df: pd.DataFrame, supplier_to_rfq: Dict[str, pd.DataFrame])
         table[match_col] = matches
         table[notes_col] = notes
 
-    # Пытаемся аккуратно отсортировать по No
     try:
-        table = table.sort_values(
-            by=["No"], key=lambda s: pd.to_numeric(s, errors="coerce")
-        ).reset_index(drop=True)
+        table = table.sort_values(by=["No"], key=lambda s: pd.to_numeric(s, errors="coerce")).reset_index(drop=True)
     except Exception:
         pass
 
-    return table
+    return suppliers, table
